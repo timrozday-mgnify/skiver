@@ -43,6 +43,9 @@ pub fn analyze(args: AnalyzeArgs) {
     
     let stats: KVmerStats;
     if let Some(reference) = &args.reference {
+        if args.lower_bound.is_none() {
+            info!("Reference is provided. Using default lower bound of 0.");
+        }
         let lower_bound = args.lower_bound.unwrap_or(0);
 
         let mut reference_kvmer_set = KVmerSet::new(args.k, args.v, true);
@@ -58,6 +61,14 @@ pub fn analyze(args: AnalyzeArgs) {
     if let Some(output_path) = &args.output_path {
         kvmer_set.output_stats(output_path, &stats, true, true);
     }
+
+    // if reference is set, the filter should be disabled
+    // [FIXME] enable --use-all by default
+    if args.reference.is_some() && !args.use_all {
+        warn!("If reference is provided, --use-all is recommended.");
+    }
+
+
     let spectrum = analyzer.analyze(&stats);
 
     // output to stdout a csv file
