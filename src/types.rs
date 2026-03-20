@@ -24,10 +24,24 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use std::collections::HashMap;
 use std::fmt;
+use serde::{Serialize, Deserialize};
 
 pub type Kmer = u64;
+
+/// Metadata for a single observation of a (key, value) k,v-mer.
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+pub struct ValueInfo {
+    /// Phred+33-encoded quality scores for the value bases (length == value_size),
+    /// or empty when the source had no quality data (FASTA).
+    pub qual: Vec<u8>,
+    /// 0-based index of the value's first base in the (trimmed) read.
+    pub start_index: u32,
+    /// Distance from the start of the value to the end of the read.
+    pub dist_to_read_end: u32,
+    /// `true` if the k,v-mer came from the forward strand, `false` for RC.
+    pub is_forward: bool,
+}
 
 /**
  * A lookup table to convert a byte to a 2-bit sequence.
@@ -249,38 +263,16 @@ pub const ALL_OPERATIONS_CANONICAL: [EditOperation; 10] = [
     EditOperation::T_,
 ];
 
-pub fn sbs96_str(op: &(EditOperation, u8, u8)) -> String {
-    format!("{}[{}]{}", SEQ_TO_CHAR[op.1 as usize], op.0, SEQ_TO_CHAR[op.2 as usize])
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct NeighborInfo {
+    pub op: EditOperation,
+    pub prev_base: u8,
+    pub next_base: u8,
+    pub position: u8,
 }
 
-/**
- * kv-mer statistics for downstream analysis.
- */
-pub struct KVmerStats {
-    pub k: u8,
-    pub v: u8,
-
-    pub keys: Vec<u64>,
-    pub consensus_values: Vec<u64>,
-
-    pub consensus_counts: Vec<u32>,
-    pub total_counts: Vec<u32>,
-    pub neighbor_counts: Vec<u32>,
-    pub error_counts: Vec<HashMap<(EditOperation, u8, u8), u32>>,
-
-    pub consensus_up_to_v_counts: Vec<Vec<u32>>,
-
-    /// Quality-score calibration: for each Phred score, how many bases agreed
-    /// with the consensus value (walking left-to-right, stopping at first mismatch).
-    pub qscore_correct: HashMap<u8, u64>,
-    /// Quality-score calibration: for each Phred score, how many bases were the
-    /// first mismatch against the consensus (one per value observation at most).
-    pub qscore_error: HashMap<u8, u64>,
-
-    /// Per-key qscore correct counts (parallel to `keys`), enabling index-based filtering.
-    pub qscore_correct_per_key: Vec<HashMap<u8, u64>>,
-    /// Per-key qscore error counts (parallel to `keys`), enabling index-based filtering.
-    pub qscore_error_per_key: Vec<HashMap<u8, u64>>,
+pub fn sbs96_str(op: &(EditOperation, u8, u8)) -> String {
+    format!("{}[{}]{}", SEQ_TO_CHAR[op.1 as usize], op.0, SEQ_TO_CHAR[op.2 as usize])
 }
 
 

@@ -4,9 +4,11 @@ log
 test.sh
 *.txt
 *.kvmer
-*.csv
 *.log
 *.out
 *.ipynb
 *.fastq.gz
+*.fastq
 .vscode
+__pycache__
+test

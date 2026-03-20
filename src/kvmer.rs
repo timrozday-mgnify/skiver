@@ -5,13 +5,25 @@ use serde::{Serialize, Deserialize};
 //use rayon::prelude::*;
 
 use std::fs::File;
-use std::io::BufWriter;
-use std::io::{prelude::*, BufReader};
+use std::io::{BufWriter, BufReader};
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 
-use crate::{seeding::*, types::*, utils::*, constants::*};
+use crate::{seeding::*, types::*};
+use crate::summary::{ErrorSummary, ErrorSpectrumSummary, PhredScoreSummary, ReadPositionSummary};
+
+/// kv-mer statistics for downstream analysis.
+pub struct KVmerStats {
+    pub k: u8,
+    pub v: u8,
+    pub keys: Vec<u64>,
+    pub consensus_values: Vec<u64>,
+    pub error_summary: ErrorSummary,
+    pub error_spectrum: ErrorSpectrumSummary,
+    pub phred_summary: PhredScoreSummary,
+    pub read_position_summary: ReadPositionSummary,
+}
+
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct KVmerSet {
@@ -20,11 +32,9 @@ pub struct KVmerSet {
     pub kv_size: u8,
     pub num_kvmers: u32,
 
-    /// key -> value -> list of per-observation quality-score strings.
-    /// Each inner Vec<u8> has exactly `value_size` bytes (Phred+33 encoded),
-    /// or is empty when the source had no quality data (FASTA).
-    /// The count of a (key, value) pair is `qual_list.len()`.
-    pub key_value_qual_map: HashMap<u64, HashMap<u64, Vec<Vec<u8>>>>,
+    /// key -> value -> list of per-observation metadata.
+    /// The count of a (key, value) pair is `info_list.len()`.
+    pub key_value_qual_map: HashMap<u64, HashMap<u64, Vec<ValueInfo>>>,
 
     // utilities to extract key and value from a kmer hash
     key_mask: u64,
@@ -55,85 +65,22 @@ impl KVmerSet {
     }
 
 
-    pub fn to_value_string(&self, kmer: u64) -> String {
-        // for debugging: convert a kmer to a string
 
-        let mut s = Vec::with_capacity(self.value_size as usize);
-        for i in (0..self.value_size).rev() {
-            let shift = i * 2;
-            let base = ((kmer >> shift) & 0b11) as usize;
-            s.push(crate::types::SEQ_TO_BYTE[base]);
-        }
-        String::from_utf8(s).unwrap()
-    }
-
-    pub fn to_key_string(&self, kmer: u64) -> String {
-        // for debugging: convert a kmer to a string
-
-        let mut s = Vec::with_capacity(self.key_size as usize);
-        for i in (0..self.key_size).rev() {
-            let shift = i * 2;
-            let base = ((kmer >> shift) & 0b11) as usize;
-            s.push(crate::types::SEQ_TO_BYTE[base]);
-        }
-        String::from_utf8(s).unwrap()
-    }
-
-    pub fn homopolymer_length(&self, key: u64, value: u64) -> u32 {
-        let mut longest_homopolymer: u32 = 1;
-        let mut current_homopolymer: u32 = 1;
-
-        // Find the longest homopolymer at the end of the key
-        let mut last_base = key & 0b11;
-        for i in 1..self.key_size {
-            let shift = i * 2;
-            let base = (key >> shift) & 0b11;
-            if base == last_base {
-                current_homopolymer += 1;
-            } else {
-                break;
-            }
-        }
-        // Extend the homopolymer into the value
-        for i in (0..self.value_size).rev() {
-            let shift = i * 2;
-            let base = (value >> shift) & 0b11;
-            if base == last_base {
-                current_homopolymer += 1;
-            } else {
-                if current_homopolymer > longest_homopolymer {
-                    longest_homopolymer = current_homopolymer;
-                }
-                current_homopolymer = 1;
-                last_base = base;
-            }
-        }
-
-        if current_homopolymer > longest_homopolymer {
-            longest_homopolymer = current_homopolymer;
-        }
-
-        longest_homopolymer
-    }
-
-
-    /// Record a batch of (key, value, qual_string) triples.
-    /// `qual_vec[i]` should have exactly `value_size` bytes, or be empty for
-    /// observations from quality-free sources (FASTA).
-    pub fn add_kv_qual_vector(&mut self, key_vec: &[u64], value_vec: &[u64], qual_vec: &[Vec<u8>]) {
-        assert!(key_vec.len() == value_vec.len() && key_vec.len() == qual_vec.len(),
-                "Key, value, and qual vectors must have the same length.");
-        for ((&key, &value), qual) in key_vec.iter().zip(value_vec.iter()).zip(qual_vec.iter()) {
+    /// Record a batch of (key, value, ValueInfo) triples.
+    pub fn add_kv_qual_vector(&mut self, key_vec: &[u64], value_vec: &[u64], info_vec: &[ValueInfo]) {
+        assert!(key_vec.len() == value_vec.len() && key_vec.len() == info_vec.len(),
+                "Key, value, and info vectors must have the same length.");
+        for ((&key, &value), info) in key_vec.iter().zip(value_vec.iter()).zip(info_vec.iter()) {
             self.key_value_qual_map
                 .entry(key).or_insert_with(HashMap::new)
                 .entry(value).or_insert_with(Vec::new)
-                .push(qual.clone());
+                .push(info.clone());
         }
         self.num_kvmers += key_vec.len() as u32;
     }
 
 
-    fn extract_markers_masked(&self, string: &[u8], key_vec: &mut Vec<u64>, value_vec: &mut Vec<u64>, c: usize, trim_front: usize, trim_back: usize) {
+    fn extract_markers_masked(&self, string: &[u8], key_vec: &mut Vec<u64>, value_vec: &mut Vec<u64>, c: usize, trim_front: usize, trim_back: usize, value_info_vec: &mut Vec<ValueInfo>) {
         let start = std::cmp::min(trim_front, string.len());
         let end = string.len().saturating_sub(trim_back);
         let string_trimmed = &string[start..end];
@@ -143,20 +90,20 @@ impl KVmerSet {
             if is_x86_feature_detected!("avx2") {
                 use crate::avx2_seeding::*;
                 unsafe {
-                    extract_markers_avx2_masked(string_trimmed, key_vec, value_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
+                    extract_markers_avx2_masked(string_trimmed, key_vec, value_vec, value_info_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
                 }
             } else {
-                fmh_seeds_masked(string_trimmed, key_vec, value_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
+                fmh_seeds_masked(string_trimmed, key_vec, value_vec, value_info_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            fmh_seeds_masked(string_trimmed, key_vec, value_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
+            fmh_seeds_masked(string_trimmed, key_vec, value_vec, value_info_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
         }
     }
 
-    /// Like `extract_markers_masked`, but also extracts quality scores.
-    fn extract_markers_masked_with_qual(&self, string: &[u8], qual: &[u8], key_vec: &mut Vec<u64>, value_vec: &mut Vec<u64>, qual_vec: &mut Vec<Vec<u8>>, c: usize, trim_front: usize, trim_back: usize) {
+    /// Like `extract_markers_masked`, but also extracts quality scores and builds `ValueInfo`.
+    fn extract_markers_masked_with_qual(&self, string: &[u8], qual: &[u8], key_vec: &mut Vec<u64>, value_vec: &mut Vec<u64>, info_vec: &mut Vec<ValueInfo>, c: usize, trim_front: usize, trim_back: usize) {
         let start = std::cmp::min(trim_front, string.len());
         let end = string.len().saturating_sub(trim_back);
         let string_trimmed = &string[start..end];
@@ -166,15 +113,15 @@ impl KVmerSet {
             if is_x86_feature_detected!("avx2") {
                 use crate::avx2_seeding::*;
                 unsafe {
-                    extract_markers_avx2_masked_with_qual(string_trimmed, qual_trimmed, key_vec, value_vec, qual_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
+                    extract_markers_avx2_masked_with_qual(string_trimmed, qual_trimmed, key_vec, value_vec, info_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
                 }
             } else {
-                fmh_seeds_masked_with_qual(string_trimmed, qual_trimmed, key_vec, value_vec, qual_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
+                fmh_seeds_masked_with_qual(string_trimmed, qual_trimmed, key_vec, value_vec, info_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            fmh_seeds_masked_with_qual(string_trimmed, qual_trimmed, key_vec, value_vec, qual_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
+            fmh_seeds_masked_with_qual(string_trimmed, qual_trimmed, key_vec, value_vec, info_vec, c, self.key_size as usize, self.value_size as usize, self.bidirectional);
         }
     }
 
@@ -202,9 +149,9 @@ impl KVmerSet {
                                 let qual = record.qual().to_vec();
                                 let mut key_vec: Vec<u64> = Vec::new();
                                 let mut value_vec: Vec<u64> = Vec::new();
-                                let mut qual_vec: Vec<Vec<u8>> = Vec::new();
-                                self.extract_markers_masked_with_qual(&seq, &qual, &mut key_vec, &mut value_vec, &mut qual_vec, c, trim_front, trim_back);
-                                self.add_kv_qual_vector(&key_vec, &value_vec, &qual_vec);
+                                let mut info_vec: Vec<ValueInfo> = Vec::new();
+                                self.extract_markers_masked_with_qual(&seq, &qual, &mut key_vec, &mut value_vec, &mut info_vec, c, trim_front, trim_back);
+                                self.add_kv_qual_vector(&key_vec, &value_vec, &info_vec);
                             }
                             Err(e) => warn!("Error reading BAM/SAM record: {}", e),
                         }
@@ -226,14 +173,14 @@ impl KVmerSet {
                         let mut value_vec: Vec<u64> = Vec::new();
                         if let Some(qual) = record.qual() {
                             // FASTQ: record quality scores alongside k,v-mers.
-                            let mut qual_vec: Vec<Vec<u8>> = Vec::new();
-                            self.extract_markers_masked_with_qual(&record.seq(), qual, &mut key_vec, &mut value_vec, &mut qual_vec, c, trim_front, trim_back);
-                            self.add_kv_qual_vector(&key_vec, &value_vec, &qual_vec);
+                            let mut info_vec: Vec<ValueInfo> = Vec::new();
+                            self.extract_markers_masked_with_qual(&record.seq(), qual, &mut key_vec, &mut value_vec, &mut info_vec, c, trim_front, trim_back);
+                            self.add_kv_qual_vector(&key_vec, &value_vec, &info_vec);
                         } else {
-                            // FASTA: no quality scores; push empty qual strings.
-                            self.extract_markers_masked(&record.seq(), &mut key_vec, &mut value_vec, c, trim_front, trim_back);
-                            let qual_vec: Vec<Vec<u8>> = vec![vec![]; key_vec.len()];
-                            self.add_kv_qual_vector(&key_vec, &value_vec, &qual_vec);
+                            // FASTA: no quality scores; record position/strand but empty qual.
+                            let mut info_vec: Vec<ValueInfo> = Vec::new();
+                            self.extract_markers_masked(&record.seq(), &mut key_vec, &mut value_vec, c, trim_front, trim_back, &mut info_vec);
+                            self.add_kv_qual_vector(&key_vec, &value_vec, &info_vec);
                         }
                     }
                     Err(e) => warn!("Error reading record: {}", e),
@@ -277,91 +224,21 @@ impl KVmerSet {
         (key_containment, key_value_containment)
     }
 
-    /**
-     * Find the number of one-edit neighbors of the consensus value[0:v].
-     * [FIXME] Optimize this function.
-     */
-    fn _num_consensus_up_to_v(&self, consensus: u64, v: u8, _bidirectional: bool, value_map: &HashMap<u64, Vec<Vec<u8>>>) -> u32 {
-        let consensus_up_to_v = consensus >> ((self.value_size - v) * 2);
-
-        let mut num_consensus: u32 = 0;
-        for (neighbor, qual_list) in value_map {
-            let _neighbors_up_to_v = neighbor >> ((self.value_size - v) * 2);
-            if _neighbors_up_to_v == consensus_up_to_v {
-                num_consensus += qual_list.len() as u32;
-            }
-        }
-        num_consensus
-    }
-
-    /// Walk every observation for a given key base-by-base against `consensus`.
-    /// For each observation (qual string):
-    ///   - empty qual string (FASTA source) → skipped entirely
-    ///   - at each position p (0 = first/leftmost base = MSB pair):
-    ///       match   → increment qscore_correct[phred] and continue
-    ///       mismatch → increment qscore_error[phred] and stop this observation
-    fn accumulate_qscore_calibration(
-        consensus: u64,
-        value_size: u8,
-        value_map: &HashMap<u64, Vec<Vec<u8>>>,
-    ) -> (HashMap<u8, u64>, HashMap<u8, u64>) {
-        let mut qscore_correct: HashMap<u8, u64> = HashMap::new();
-        let mut qscore_error: HashMap<u8, u64> = HashMap::new();
-        for (value, qual_list) in value_map {
-            for qual_string in qual_list {
-                if qual_string.is_empty() {
-                    continue; // no quality data (FASTA source)
-                }
-                for p in 0..value_size as usize {
-                    let bit_shift = 2 * (value_size as usize - 1 - p);
-                    let value_base     = (value     >> bit_shift) & 0b11;
-                    let consensus_base = (consensus >> bit_shift) & 0b11;
-                    let phred = qual_string[p].saturating_sub(33);
-                    if value_base == consensus_base {
-                        *qscore_correct.entry(phred).or_insert(0) += 1;
-                    } else {
-                        *qscore_error.entry(phred).or_insert(0) += 1;
-                        break;
-                    }
-                }
-            }
-        }
-        (qscore_correct, qscore_error)
-    }
-
-    pub fn get_stats(&self, threshold: u32) -> KVmerStats {
-        // record the keys and consensus values for output
+    pub fn get_stats(&self, threshold: u32, first_base_only: bool) -> KVmerStats {
         let mut keys: Vec<u64> = Vec::new();
         let mut consensus_values: Vec<u64> = Vec::new();
-
-        // count the number of consensus and error kmers
-        let mut consensus_counts: Vec<u32> = Vec::new();
-        // A map that records the number of each type of error for each consensus kmer
-        let mut error_counts: Vec<HashMap<(EditOperation, u8, u8), u32>> = Vec::new();
-        // A vector of size value_size, recording the number of neighbors up to each position
-        let mut consensus_up_to_v_counts: Vec<Vec<u32>> = Vec::new();
-        for _v in 1..=self.value_size {
-            consensus_up_to_v_counts.push(Vec::new());
-        }
-        // Total number of times the key appears
-        let mut total_counts: Vec<u32> = Vec::new();
-        // Number of time a one-edit neighbor of the consensus value appears
-        let mut neighbor_counts: Vec<u32> = Vec::new();
-        // Quality-score calibration accumulators
-        let mut qscore_correct: HashMap<u8, u64> = HashMap::new();
-        let mut qscore_error: HashMap<u8, u64> = HashMap::new();
-        let mut qscore_correct_per_key: Vec<HashMap<u8, u64>> = Vec::new();
-        let mut qscore_error_per_key: Vec<HashMap<u8, u64>> = Vec::new();
+        let mut error_summary = ErrorSummary::new(self.value_size as usize);
+        let mut error_spectrum = ErrorSpectrumSummary::new(self.value_size as usize);
+        let mut phred_summary = PhredScoreSummary::new();
+        let mut read_position_summary = ReadPositionSummary::new();
 
         for (key, value_map) in &self.key_value_qual_map {
-
+            // find the consensus (most frequent) value
             let mut max_count = 0;
             let mut sum_count = 0;
             let mut max_value: u64 = 0;
-
-            // find the consensus value
-            for (value, qual_list) in value_map {
-                let count = qual_list.len() as u32;
+            for (value, info_list) in value_map {
+                let count = info_list.len() as u32;
                 sum_count += count;
                 if count > max_count {
                     max_count = count;
@@ -374,56 +251,13 @@ impl KVmerSet {
                 continue;
             }
 
-            //println!("Key: {}", self.to_key_string(*key));
-            //for (value, qual_list) in value_map {
-            //    println!("  Reference value: {}, count: {}", self.to_value_string(*value), qual_list.len());
-            //}
-
-            // Find the count of error types at v=self.value_size
-            let mut error_count_map: HashMap<(EditOperation, u8, u8), u32> = HashMap::new();
-            let neighbors = _get_neighbors(max_value, self.value_size, self.bidirectional);
-            if neighbors.contains_key(&max_value) {
-                // This would confound the X=0 case
-                continue;
+            if error_summary.update(*key, max_value, self.key_size, self.value_size, self.bidirectional, value_map) {
+                keys.push(*key);
+                consensus_values.push(max_value);
+                error_spectrum.update(error_summary.error_counts_per_key.last().unwrap().clone(), error_summary.forward_error_counts_per_key.last().unwrap().clone());
+                phred_summary.update(max_value, self.value_size, value_map, first_base_only);
+                read_position_summary.update(max_value, self.value_size, value_map, first_base_only);
             }
-
-            // find the error and consensus up to v counts
-            for v in 1..=self.value_size {
-                let consensus_up_to_v = self._num_consensus_up_to_v(max_value, v, self.bidirectional, value_map);
-                consensus_up_to_v_counts[(v - MIN_VALUE_FOR_ERROR_ESTIMATION) as usize].push(consensus_up_to_v);
-            }
-
-            let mut num_neighbors = 0;
-            //println!("Neighbors of {}: {:?}", max_value, neighbors);
-            //println!("Analyzing key: {}, consensus value: {}", self.to_key_string(*key), self.to_value_string(max_value));
-            for (value, qual_list) in value_map {
-                let count = qual_list.len() as u32;
-                if *value != max_value && neighbors.contains_key(value) {
-                    let (op, prev_base, next_base) = neighbors.get(value).unwrap();
-                    //println!("Value: {}, Operation: {:?}, Position: {}", self.to_value_string(*value), op, pos);
-
-                    // update the error count map
-                    let entry = error_count_map.entry((*op, *prev_base, *next_base)).or_insert(0);
-                    *entry += count;
-                    num_neighbors += count;
-                }
-            }
-            //println!("{:?}", error_positions);
-
-            // quality-score calibration for this key
-            let (key_correct, key_error) = Self::accumulate_qscore_calibration(max_value, self.value_size, value_map);
-            for (&q, &c) in &key_correct { *qscore_correct.entry(q).or_insert(0) += c; }
-            for (&q, &e) in &key_error   { *qscore_error.entry(q).or_insert(0)   += e; }
-
-            // update the vectors
-            keys.push(*key);
-            consensus_values.push(max_value);
-            consensus_counts.push(max_count);
-            error_counts.push(error_count_map);
-            total_counts.push(sum_count);
-            neighbor_counts.push(num_neighbors);
-            qscore_correct_per_key.push(key_correct);
-            qscore_error_per_key.push(key_error);
         }
 
         KVmerStats {
@@ -431,42 +265,21 @@ impl KVmerSet {
             v: self.value_size,
             keys,
             consensus_values,
-            consensus_counts,
-            total_counts,
-            neighbor_counts,
-            error_counts,
-            consensus_up_to_v_counts,
-            qscore_correct,
-            qscore_error,
-            qscore_correct_per_key,
-            qscore_error_per_key,
+            error_summary,
+            error_spectrum,
+            phred_summary,
+            read_position_summary,
         }
     }
 
     #[allow(unused)]
-    pub fn get_stats_with_reference(&self, threshold: u32, reference: &KVmerSet) -> KVmerStats {
-        // record the keys and consensus values for output
+    pub fn get_stats_with_reference(&self, threshold: u32, reference: &KVmerSet, first_base_only: bool) -> KVmerStats {
         let mut keys: Vec<u64> = Vec::new();
         let mut consensus_values: Vec<u64> = Vec::new();
-
-        // count the number of consensus and error kmers
-        let mut consensus_counts: Vec<u32> = Vec::new();
-        // A map that records the number of each type of error for each consensus kmer
-        let mut error_counts: Vec<HashMap<(EditOperation, u8, u8), u32>> = Vec::new();
-        // A vector of size value_size, recording the number of consensus up to each position
-        let mut consensus_up_to_v_counts: Vec<Vec<u32>> = Vec::new();
-        for _v in 1..=self.value_size {
-            consensus_up_to_v_counts.push(Vec::new());
-        }
-        // Total number of times the key appears
-        let mut total_counts: Vec<u32> = Vec::new();
-        // Number of time a one-edit neighbor of the consensus value appears
-        let mut neighbor_counts: Vec<u32> = Vec::new();
-        // Quality-score calibration accumulators
-        let mut qscore_correct: HashMap<u8, u64> = HashMap::new();
-        let mut qscore_error: HashMap<u8, u64> = HashMap::new();
-        let mut qscore_correct_per_key: Vec<HashMap<u8, u64>> = Vec::new();
-        let mut qscore_error_per_key: Vec<HashMap<u8, u64>> = Vec::new();
+        let mut error_summary = ErrorSummary::new(self.value_size as usize);
+        let mut error_spectrum = ErrorSpectrumSummary::new(self.value_size as usize);
+        let mut phred_summary = PhredScoreSummary::new();
+        let mut read_position_summary = ReadPositionSummary::new();
 
         // for debugging: the number of k-mers that the read set shares with the reference
         let mut shared_kmer_count: u32 = 0;
@@ -480,20 +293,7 @@ impl KVmerSet {
             let consensus_value = *ref_value_map.keys().next().unwrap();
             let value_map = self.key_value_qual_map.get(&key).unwrap();
 
-            let mut max_count = 0;
-            let mut sum_count = 0;
-            let mut max_value: u64 = 0;
-
-            // find the consensus value
-            for (value, qual_list) in value_map {
-                let count = qual_list.len() as u32;
-                sum_count += count;
-                if count > max_count {
-                    max_count = count;
-                    max_value = *value;
-                }
-            }
-            let consensus_count = value_map.get(&consensus_value).map_or(0, |q| q.len() as u32);
+            let sum_count: u32 = value_map.values().map(|v| v.len() as u32).sum();
             shared_kmer_count += sum_count;
 
             if ref_value_map.len() > 1 {
@@ -508,49 +308,13 @@ impl KVmerSet {
                 continue;
             }
 
-            // Find the count of error types at v=self.value_size
-            let mut error_count_map: HashMap<(EditOperation, u8, u8), u32> = HashMap::new();
-            let neighbors = _get_neighbors(consensus_value, self.value_size, self.bidirectional);
-            if neighbors.contains_key(&consensus_value) {
-                // This would confound the X=0 case
-                continue;
+            if error_summary.update(*key, consensus_value, self.key_size, self.value_size, self.bidirectional, value_map) {
+                keys.push(*key);
+                consensus_values.push(consensus_value);
+                error_spectrum.update(error_summary.error_counts_per_key.last().unwrap().clone(), error_summary.forward_error_counts_per_key.last().unwrap().clone());
+                phred_summary.update(consensus_value, self.value_size, value_map, first_base_only);
+                read_position_summary.update(consensus_value, self.value_size, value_map, first_base_only);
             }
-
-            // find the error and consensus up to v counts
-            for v in 1..=self.value_size {
-                let consensus_up_to_v = self._num_consensus_up_to_v(consensus_value, v, self.bidirectional, value_map);
-                consensus_up_to_v_counts[(v - 1) as usize].push(consensus_up_to_v);
-            }
-
-            let mut num_neighbors = 0;
-            for (value, qual_list) in value_map {
-                let count = qual_list.len() as u32;
-                if *value != consensus_value && neighbors.contains_key(value) {
-                    let (op, prev_base, next_base) = neighbors.get(value).unwrap();
-                    //println!("Value: {}, Operation: {:?}, Position: {}", self.to_value_string(*value), op, pos);
-
-                    // update the error count map
-                    let entry = error_count_map.entry((*op, *prev_base, *next_base)).or_insert(0);
-                    *entry += count;
-                    num_neighbors += count;
-                }
-            }
-            //println!("{:?}", error_positions);
-
-            // quality-score calibration for this key
-            let (key_correct, key_error) = Self::accumulate_qscore_calibration(consensus_value, self.value_size, value_map);
-            for (&q, &c) in &key_correct { *qscore_correct.entry(q).or_insert(0) += c; }
-            for (&q, &e) in &key_error   { *qscore_error.entry(q).or_insert(0)   += e; }
-
-            // update the vectors
-            keys.push(*key);
-            consensus_values.push(consensus_value);
-            consensus_counts.push(consensus_count);
-            error_counts.push(error_count_map);
-            total_counts.push(sum_count);
-            neighbor_counts.push(num_neighbors);
-            qscore_correct_per_key.push(key_correct);
-            qscore_error_per_key.push(key_error);
         }
 
         //println!("Total count of kvmers that match reference: {}", shared_kmer_count);
@@ -562,70 +326,10 @@ impl KVmerSet {
             v: self.value_size,
             keys,
             consensus_values,
-            consensus_counts,
-            total_counts,
-            neighbor_counts,
-            error_counts,
-            consensus_up_to_v_counts,
-            qscore_correct,
-            qscore_error,
-            qscore_correct_per_key,
-            qscore_error_per_key,
-        }
-
-
-    }
-
-    pub fn output_stats(&self, output_path: &String, stats: &KVmerStats, show_error_types: bool, show_error_vs_v: bool) {
-        // create file for output
-        let mut writer = File::create(&output_path).unwrap();
-        // general info
-        write!(writer, "key,consensus_value,homopolymer_length,consensus_count,neighbor_count,total_count").unwrap();
-        // errors
-        if show_error_types {
-            for op in ALL_OPERATIONS {
-                write!(writer, ",{:?}", op).unwrap();
-            }
-        }
-        // for p vs. v regression
-        if show_error_vs_v {
-            for v in MIN_VALUE_FOR_ERROR_ESTIMATION..=self.value_size {
-                write!(writer, ",consensus_count_up_to_v{}", v).unwrap();
-            }
-        }
-
-        writeln!(writer).unwrap();
-
-
-        for i in 0..stats.keys.len() {
-            write!(writer,
-                "{},{},{},{},{},{}",
-                self.to_key_string(stats.keys[i]),
-                self.to_value_string(stats.consensus_values[i]),
-                self.homopolymer_length(stats.keys[i], stats.consensus_values[i]),
-                stats.consensus_counts[i],
-                stats.neighbor_counts[i],
-                stats.total_counts[i],
-            ).unwrap();
-            if show_error_types {
-                for op in ALL_OPERATIONS.iter() {
-                    let mut total_count: u32 = 0;
-                    for prev_base in 0..5 {
-                        for next_base in 0..5 {
-                            let count = stats.error_counts[i].get(&(*op, prev_base, next_base)).unwrap_or(&0);
-                            total_count += *count;
-                        }
-                    }
-                    write!(writer, ",{}", total_count).unwrap();
-                }
-            }
-            if show_error_vs_v {
-                for v in 1..=self.value_size {
-                    let consensus_count_up_to_v = stats.consensus_up_to_v_counts[(v - 1) as usize][i];
-                    write!(writer, ",{}", consensus_count_up_to_v).unwrap();
-                }
-            }
-            writeln!(writer).unwrap();
+            error_summary,
+            error_spectrum,
+            phred_summary,
+            read_position_summary,
         }
     }
 
@@ -648,7 +352,7 @@ impl KVmerSet {
         //let reader = BufReader::new(file);
         let that: KVmerSet = bincode::deserialize_from(reader)
             .expect(&format!(
-                "The sketch `{}` is not a valid sketch.",
+                "The sketch `{}` is not a valid sketch. It may be generated by an older version of skiver. Please regenerate the sketch with the current version of skiver.",
                 &input_file
             ));
 
@@ -658,235 +362,12 @@ impl KVmerSet {
         } else {
             for (kmer, value_map) in that.key_value_qual_map {
                 let entry = self.key_value_qual_map.entry(kmer).or_insert_with(HashMap::new);
-                for (value, qual_list) in value_map {
-                    entry.entry(value).or_insert_with(Vec::new).extend(qual_list);
+                for (value, info_list) in value_map {
+                    entry.entry(value).or_insert_with(Vec::new).extend(info_list);
                 }
             }
             self.num_kvmers += that.num_kvmers;
         }
-    }
-
-}
-
-
-
-pub struct VmerSet {
-    pub value_size: u8,
-    pub kvmer_set: KVmerSet,
-}
-
-impl VmerSet {
-    pub fn new(value_size: u8, bidirectional: bool) -> Self {
-        VmerSet {
-            value_size,
-            kvmer_set: KVmerSet::new(0, value_size, bidirectional),
-        }
-    }
-
-    pub fn add_to_keys(&mut self, seed_vec: &[u64]) {
-        for &kmer in seed_vec {
-            let _entry = self.kvmer_set.key_value_qual_map.entry(kmer).or_insert_with(HashMap::new);
-        }
-    }
-
-    pub fn _get_neighbors(&self, value: u64) -> HashMap<u64, EditOperation> {
-        // get all the values with edit distance 1 from the input value
-
-        let mut neighbors: HashMap<u64, EditOperation> = HashMap::new();
-        let bases = [0, 1, 2, 3]; // A, C, G, T
-
-        for i in 0..self.value_size {
-            let shift = i * 2;
-
-            // Substitutions
-            for &b in &bases {
-                let current_base = (value >> shift) & 0b11;
-                if b != current_base {
-                    let neighbor = (value & !(0b11 << shift)) | (b << shift);
-                    neighbors.insert(neighbor, BASES_TO_SUBSTITUTION[current_base as usize][b as usize].unwrap());
-                }
-            }
-
-            // Indels
-            for &b in &bases {
-                if shift == 0 && b == (value >> shift) & 0b11 {
-                    continue; // skip the original base for the first position
-                }
-
-                let left_part = (value >> (shift + 2)) << ((shift + 2));
-                let right_part = value & ((1 << (shift + 2)) - 1);
-                let neighbor_insert = left_part | (b << shift) | (right_part >> 2);
-                neighbors.entry(neighbor_insert)
-                    .and_modify(|op|
-                        if *op != BASES_TO_INSERTION[b as usize].unwrap() {
-                            *op = EditOperation::AMBIGUOUS
-                        }
-                    )
-                    .or_insert(BASES_TO_INSERTION[b as usize].unwrap());
-
-
-
-                let right_part = value & ((1 << shift) - 1);
-                let neighbor_delete = left_part | (right_part << 2) | b;
-                let original_base = (value >> shift) & 0b11;
-                neighbors.entry(neighbor_delete)
-                    .and_modify(|op|
-                        if *op != BASES_TO_DELETION[original_base as usize].unwrap() {
-                            *op = EditOperation::AMBIGUOUS
-                        }
-                    )
-                    .or_insert(BASES_TO_DELETION[original_base as usize].unwrap());
-            }
-        }
-
-        neighbors
-
-    }
-
-    pub fn _get_relevant_values(&self, _threshold: u32) -> HashSet<u64> {
-        let mut relevant_values: HashSet<u64> = HashSet::new();
-
-        // for all the keys in kvmer_set with counts above threshold, get their neighbors
-        for (key, _) in &self.kvmer_set.key_value_qual_map {
-            relevant_values.insert(*key);
-            let neighbors = _get_neighbors(*key, self.value_size as u8, self.kvmer_set.bidirectional);
-            for (neighbor, _op) in neighbors {
-                relevant_values.insert(neighbor);
-            }
-        }
-
-        relevant_values
-    }
-
-    // MODIFIED: Added BAM/SAM support
-    pub fn add_file_first_pass(
-        &mut self,
-        seq_file: &str,
-        c: usize,
-    ) {
-        let seq_file_clone = seq_file.to_string();
-
-        if seq_file_clone.ends_with(".bam") || seq_file_clone.ends_with(".sam") {
-            match bam::Reader::from_path(&seq_file_clone) {
-                Ok(mut reader) => {
-                    for record_result in reader.records() {
-                        match record_result {
-                            Ok(record) => {
-                                let seq = record.seq().as_bytes();
-                                let mut kmer_vec: Vec<u64> = Vec::new();
-                                let mut _value_vec: Vec<u64> = Vec::new();
-                                fmh_seeds_masked(&seq, &mut kmer_vec, &mut _value_vec, c, self.value_size as usize, 0 as usize, self.kvmer_set.bidirectional);
-                                self.add_to_keys(&kmer_vec);
-                            }
-                            Err(e) => warn!("Error reading BAM/SAM record: {}", e),
-                        }
-                    }
-                }
-                Err(e) => error!("{} is not a valid BAM/SAM file (Error: {}); skipping.", seq_file_clone, e),
-            }
-        } else {
-            let reader = parse_fastx_file(&seq_file_clone);
-            if !reader.is_ok() {
-                println!("{} is not a valid fasta/fastq file; skipping.", seq_file_clone);
-            } else {
-                let mut reader = reader.unwrap();
-                while let Some(record) = reader.next() {
-                    match record {
-                        Ok(record) => {
-                            let seq = record.seq();
-                            let mut kmer_vec: Vec<u64> = Vec::new();
-                            let mut _value_vec: Vec<u64> = Vec::new();
-                            fmh_seeds_masked(seq.as_ref(), &mut kmer_vec, &mut _value_vec, c, self.value_size as usize, 0 as usize, self.kvmer_set.bidirectional);
-                            self.add_to_keys(&kmer_vec);
-                        }
-                        Err(e) => warn!("Error reading record: {}", e),
-                    }
-                }
-            }
-        }
-    }
-
-    // MODIFIED: Added BAM/SAM support
-    pub fn add_file_second_pass(
-        &mut self,
-        seq_file: &str,
-        value_count: &mut HashMap<u64, u32>,
-        relevant_values: &HashSet<u64>,
-    ) {
-        let seq_file_clone = seq_file.to_string();
-
-        if seq_file_clone.ends_with(".bam") || seq_file_clone.ends_with(".sam") {
-            match bam::Reader::from_path(&seq_file_clone) {
-                Ok(mut reader) => {
-                    for record_result in reader.records() {
-                        match record_result {
-                            Ok(record) => {
-                                let seq = record.seq().as_bytes();
-                                count_seeds_in_set(&seq, self.value_size as usize, value_count, relevant_values, self.kvmer_set.bidirectional);
-                            }
-                            Err(e) => warn!("Error reading BAM/SAM record: {}", e),
-                        }
-                    }
-                }
-                Err(e) => error!("{} is not a valid BAM/SAM file (Error: {}); skipping.", seq_file_clone, e),
-            }
-        } else {
-            let reader = parse_fastx_file(&seq_file_clone);
-            if !reader.is_ok() {
-                println!("{} is not a valid fasta/fastq file; skipping.", seq_file_clone);
-            } else {
-                let mut reader = reader.unwrap();
-                while let Some(record) = reader.next() {
-                    match record {
-                        Ok(record) => {
-                            let seq = record.seq();
-                            count_seeds_in_set(seq.as_ref(), self.value_size as usize, value_count, relevant_values, self.kvmer_set.bidirectional);
-                        }
-                        Err(e) => warn!("Error reading record: {}", e),
-                    }
-                }
-            }
-        }
-    }
-
-
-
-    pub fn add_value_counts(&mut self, value_count: &HashMap<u64, u32>) {
-        let mut keys_to_remove: Vec<u64> = Vec::new();
-        for (key, value_map) in &mut self.kvmer_set.key_value_qual_map {
-            if let Some(&count) = value_count.get(key) {
-                // No quality data available; push `count` empty qual strings.
-                let entry = value_map.entry(*key).or_insert_with(Vec::new);
-                entry.extend(std::iter::repeat(vec![]).take(count as usize));
-            } else {
-                continue;
-            }
-            let neighbors = _get_neighbors(*key, self.value_size as u8, self.kvmer_set.bidirectional);
-
-            let mut max_count = 0u32;
-            for (value, _op) in neighbors {
-                if let Some(&count) = value_count.get(&value) {
-                    let entry = value_map.entry(value).or_insert_with(Vec::new);
-                    entry.extend(std::iter::repeat(vec![]).take(count as usize));
-                    max_count = max_count.max(entry.len() as u32);
-                }
-            }
-
-            // if the max count is larger than the count of the key itself,
-            // delete this key from the kvmer_set
-            if let Some(qual_list) = value_map.get(key) {
-                if (qual_list.len() as u32) < max_count {
-                    keys_to_remove.push(*key);
-                }
-            }
-        }
-        for key in keys_to_remove {
-            self.kvmer_set.key_value_qual_map.remove(&key);
-        }
-    }
-
-    pub fn get_stats(&self, threshold: u32) -> KVmerStats {
-        self.kvmer_set.get_stats(threshold)
     }
 
 }

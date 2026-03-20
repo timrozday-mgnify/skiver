@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 
 use crate::types::*;
+use crate::kvmer::KVmerStats;
 use crate::constants::*;
 use crate::cmdline::AnalyzeArgs;
 use crate::huber::*;
@@ -9,16 +10,41 @@ use crate::huber::*;
 use log::info;
 use rand::Rng;
 
+/**
+ * Info of the estimated error rate and error spectrum
+ * Each field is a tuple of (estimate, (5th_percentile, 95th_percentile))
+ * where the confidence interval is estimated using bootstrap
+ */
+pub struct ReadPositionCalibration {
+    pub index: u32,
+    pub from_start: bool,
+    pub num_correct: u64,
+    pub num_error: u64,
+}
+
+pub struct QscoreCalibration {
+    pub qscore: u8,
+    pub num_correct: u64,
+    pub num_error: u64,
+    pub error_rate: f64,
+    pub ci_lower: f64,
+    pub ci_upper: f64,
+}
 
 pub struct ErrorSpectrum {
+    // estimated Weibull parameters
     pub estimated_lambda: (f32, (f32, f32)),
     pub estimated_beta: (f32, (f32, f32)),
+
+    // estimated error rates
     pub per_base_error_rate: (f32, (f32, f32)),
     pub effective_error_rate: (f32, (f32, f32)),
 
+    // coverage information
     pub key_coverage: (f32, (f32, f32)),
     pub estimated_coverage: (f32, (f32, f32)),
 
+    // error spectrum
     pub snp_rate: HashMap<(EditOperation, u8, u8), u32>,
 
     pub bidirectional: bool,
@@ -434,58 +460,99 @@ impl ErrorAnalyzer {
 
     
 
+    /// Approximate erfc(x) using a rational polynomial (Abramowitz & Stegun 7.1.26, max error 1.5e-7).
+    fn erfc_approx(x: f64) -> f64 {
+        if x < 0.0 {
+            return 2.0 - Self::erfc_approx(-x);
+        }
+        let t = 1.0 / (1.0 + 0.3275911 * x);
+        let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        poly * (-x * x).exp()
+    }
+
+    fn normal_cdf(z: f64) -> f64 {
+        0.5 * Self::erfc_approx(-z / std::f64::consts::SQRT_2)
+    }
+
+    /// P(X <= k_obs) where X ~ Binomial(n, p), using normal approximation with continuity correction.
+    fn binomial_cdf_lower(n: u32, k_obs: u32, p: f64) -> f64 {
+        if n == 0 { return 1.0; }
+        if p <= 0.0 { return 1.0; }
+        if p >= 1.0 { return if k_obs >= n { 1.0 } else { 0.0 }; }
+        let mean = n as f64 * p;
+        let var = n as f64 * p * (1.0 - p);
+        if var < 1e-10 { return if k_obs as f64 >= mean { 1.0 } else { 0.0 }; }
+        let z = (k_obs as f64 + 0.5 - mean) / var.sqrt();
+        Self::normal_cdf(z)
+    }
+
     /**
-     * Identify outliers based on hazard ratios across different v values,
-     * return the indices of inliers.
+     * Identify outliers iteratively using the Weibull hazard model.
+     *
+     * Algorithm:
+     *  1. Estimate lambda and beta from all active keys.
+     *  2. For each v and each active key, compute h(t) = 1 - exp(-lambda*(t^beta - (t-1)^beta)).
+     *     Treat the count at t as Binomial(n, 1-h(t)) where n is the count at t-1.
+     *     If P(X <= observed) < outlier_threshold (default 1e-9), mark the key as an outlier.
+     *  3. Re-estimate lambda and beta from the remaining keys.
+     *  4. Repeat until lambda and beta change by less than 1e-4.
      */
     pub fn find_hazard_ratio_outliers(&self, stats: &KVmerStats) -> Vec<usize> {
+        let n_keys = stats.error_summary.consensus_counts.len();
+        let mut active = vec![true; n_keys];
 
-        let mut res = vec![true; stats.consensus_counts.len()];
-        let mut x: &Vec<u32>;
-        let mut y: &Vec<u32>;
-        // [TODO] Return also the number of outliers for each v
-        //let mut num_outliers = [0; stats.consensus_counts.len()];
-        
-        for v in 1..=(stats.v - self.args.ignore_last_hazard_ratios as u8) {
-            if v - 1 == 0 {
-                x = &stats.total_counts;
-                y = &stats.consensus_up_to_v_counts[0];
-            } else {
-                x = &stats.consensus_up_to_v_counts[(v - 1 - 1) as usize];
-                y = &stats.consensus_up_to_v_counts[(v - 1) as usize];
+        let max_iter = 10;
+        let convergence_tol = 1e-5_f32;
+        let p_threshold = self.args.outlier_threshold as f64;
+
+        let mut prev_lambda = f32::INFINITY;
+        let mut prev_beta = f32::INFINITY;
+
+        let v_max = stats.v - self.args.ignore_last_hazard_ratios as u8;
+
+        for iter in 0..max_iter {
+            let indices: Vec<usize> = (0..n_keys).filter(|&i| active[i]).collect();
+            if indices.is_empty() { break; }
+
+            let (lambda, beta, _, _, _) = self.estimate_hazard_ratio(stats, &indices);
+
+            if (lambda - prev_lambda).abs() < convergence_tol && (beta - prev_beta).abs() < convergence_tol {
+                info!("Iterative outlier removal converged after {} iteration(s).", iter);
+                break;
             }
-            let ratio = x.iter().zip(y.iter())
-                .map(|(&xi, &yi)| if xi != 0 { yi as f32 / xi as f32 } else { 1. })
-                .collect::<Vec<f32>>();
+            prev_lambda = lambda;
+            prev_beta = beta;
 
-            // sort the ratios and exclude the ratios that = 1., and find the IQR
-            let mut sorted_ratio = ratio.clone();
-            sorted_ratio.sort_by(f32::total_cmp);
-            // exclude ratios that are exactly 1.
-            let filtered_ratio: Vec<f32> = sorted_ratio.into_iter().filter(|&r| r < 1.).collect();
-            let n = filtered_ratio.len();
-            if n == 0 {
-                continue;
-            }
-            let q1 = filtered_ratio[n / 4];
-            let q3 = filtered_ratio[(3 * n) / 4];
-            let iqr = q3 - q1;
+            for v in 1..=v_max {
+                // t is the time coordinate used when fitting: t = (v-1) + k
+                let t = (v - 1) as f64 + self.args.k as f64;
+                let t_beta = t.powf(beta as f64);
+                let t1_beta = if t > 1.0 { (t - 1.0).powf(beta as f64) } else { 0.0 };
+                let h_t = 1.0 - (-(lambda as f64) * (t_beta - t1_beta)).exp();
+                let p_survival = (1.0 - h_t).clamp(0.0, 1.0);
 
-            let lower_bound = q1 - self.args.outlier_threshold * iqr;
-            for (i, &r) in ratio.iter().enumerate() {
-                if r < lower_bound {
-                    // mark as outlier
-                    res[i] = false;
+                for i in 0..n_keys {
+                    if !active[i] { continue; }
+
+                    let n = if v == 1 {
+                        stats.error_summary.total_counts[i]
+                    } else {
+                        stats.error_summary.consensus_up_to_v_counts[(v - 2) as usize][i]
+                    };
+                    let k_obs = stats.error_summary.consensus_up_to_v_counts[(v - 1) as usize][i];
+
+                    if n == 0 { continue; }
+
+                    if Self::binomial_cdf_lower(n, k_obs, p_survival) < p_threshold {
+                        active[i] = false;
+                    }
                 }
             }
         }
 
-        let indices: Vec<usize> = res.iter().enumerate()
-                                .filter_map(|(i, &is_inlier)| if is_inlier { Some(i) } else { None })
-                                .collect();
-        
-        info!("Identified {} inliers out of {} data points based on hazard ratios ({}%).", indices.len(), res.len(), (indices.len() as f32 / res.len() as f32) * 100.0);
-
+        let indices: Vec<usize> = (0..n_keys).filter(|&i| active[i]).collect();
+        info!("Identified {} inliers out of {} data points based on iterative Binomial outlier removal ({}%).",
+            indices.len(), n_keys, (indices.len() as f32 / n_keys as f32) * 100.0);
         indices
     }
 
@@ -499,8 +566,8 @@ impl ErrorAnalyzer {
         let mut error_counts: HashMap<(EditOperation, u8, u8), u32> = HashMap::new();
 
         indices.iter().for_each(|&i| {
-            for (op, count_map) in stats.error_counts[i].iter() {
-                let count = error_counts.entry(*op).or_insert(0);
+            for (ni, count_map) in stats.error_spectrum.error_counts[i].iter() {
+                let count = error_counts.entry((ni.op, ni.prev_base, ni.next_base)).or_insert(0);
                 *count += *count_map;
             }
         });
@@ -584,11 +651,11 @@ impl ErrorAnalyzer {
 
             for v in 1..=(stats.v - self.args.ignore_last_hazard_ratios as u8) {
                 if v - 1 == 0 {
-                    x = &stats.total_counts;
-                    y = &stats.consensus_up_to_v_counts[0];
+                    x = &stats.error_summary.total_counts;
+                    y = &stats.error_summary.consensus_up_to_v_counts[0];
                 } else {
-                    x = &stats.consensus_up_to_v_counts[(v - 1 - 1) as usize];
-                    y = &stats.consensus_up_to_v_counts[(v - 1) as usize];
+                    x = &stats.error_summary.consensus_up_to_v_counts[(v - 1 - 1) as usize];
+                    y = &stats.error_summary.consensus_up_to_v_counts[(v - 1) as usize];
                 }
 
                 let h = self.calculate_ratio(x, y, &indices_sample);
@@ -624,28 +691,10 @@ impl ErrorAnalyzer {
         let upper_error_rate = error_rate_list[(self.args.num_experiments as f32 * 0.95) as usize];
 
         ((lower_lambda, upper_lambda), (lower_beta, upper_beta), hazard_ratio_range_list, (lower_error_rate, upper_error_rate))
-        /* 
-        let mut mean = alpha_list.iter().zip(beta_list.iter())
-            .map(|(&a, &b)| a / (a + b))
-            .collect::<Vec<f32>>();
-        mean.sort_by(f32::total_cmp);
-        let lower_mean = mean[(self.num_experiments as f32 * 0.05) as usize];
-        let upper_mean = mean[(self.num_experiments as f32 * 0.95) as usize];
-
-        let std = alpha_list.iter().zip(beta_list.iter())
-            .map(|(&a, &b)| ((a * b) / (((a + b) * (a + b)) * (a + b + 1.0))).sqrt())
-            .collect::<Vec<f32>>();
-        let mut std_sorted = std.clone();
-        std_sorted.sort_by(f32::total_cmp);
-        let lower_std = std_sorted[(self.num_experiments as f32 * 0.05) as usize];
-        let upper_std = std_sorted[(self.num_experiments as f32 * 0.95) as usize];
-
-        ((lower_mean, upper_mean), (lower_std, upper_std))
-        */
     }
 
 
-    // returns (estimated_a, estimated_b, hazard_ratios, x_sum, y_sum)
+    // returns (estimated_lambda, estimated_beta, hazard_ratios, x_sum, y_sum)
     pub fn estimate_hazard_ratio(&self, stats: &KVmerStats, indices: &Vec<usize>) -> (f32, f32, Vec<f32>, Vec<u32>, Vec<u32>) {
         let mut x: &Vec<u32>;
         let mut y: &Vec<u32>;
@@ -656,48 +705,26 @@ impl ErrorAnalyzer {
 
         for v in 1..=(stats.v - self.args.ignore_last_hazard_ratios as u8) {
             if v - 1 == 0 {
-                x = &stats.total_counts;
-                y = &stats.consensus_up_to_v_counts[0];
+                x = &stats.error_summary.total_counts;
+                y = &stats.error_summary.consensus_up_to_v_counts[0];
             } else {
-                x = &stats.consensus_up_to_v_counts[(v - 1 - 1) as usize];
-                y = &stats.consensus_up_to_v_counts[(v - 1) as usize];
+                x = &stats.error_summary.consensus_up_to_v_counts[(v - 1 - 1) as usize];
+                y = &stats.error_summary.consensus_up_to_v_counts[(v - 1) as usize];
             }
-
-            /*
-            println!("v={}, x_sum={}, y_sum={}", v, 
-                    x.iter().sum::<u32>(), // self.sum_indices(x, indices), 
-                    y.iter().sum::<u32>(), //self.sum_indices(y, indices));
-            );
-            */
 
             let h = self.calculate_ratio(x, y, indices);
             hazard_ratios.push(1. - h);
             x_sum.push(self.sum_indices(x, indices));
             y_sum.push(self.sum_indices(y, indices));
         }
-        /*
-        for &h in hazard_ratios.iter() {
-            println!("{},", h);
-        }
-        */
-        /* 
-        // estimate the parameters of the beta distribution
-        let (alpha, beta) = self.fit_hazard_ratio_beta_distribution(&hazard_ratios, indices.len());
-        let mean = alpha / (alpha + beta);
-        let std = (alpha * beta / (((alpha + beta) * (alpha + beta)) * (alpha + beta + 1.0))).sqrt();
-
-        (mean, std, alpha, beta)
-        */
 
         let (lambda, beta) = self.fit_hazard_ratio(&hazard_ratios);
         //println!("Weibull parameters: alpha = {}, beta = {}", a, b);
-        (lambda, beta, hazard_ratios, x_sum, y_sum)
-
-        
+        (lambda, beta, hazard_ratios, x_sum, y_sum) 
     }
 
     pub fn key_coverage(&self, stats: &KVmerStats, indices: &Vec<usize>) -> (f32, (f32, f32)) {
-        let mut coverages: Vec<u32> = indices.iter().map(|&i| stats.total_counts[i]).collect();
+        let mut coverages: Vec<u32> = indices.iter().map(|&i| stats.error_summary.total_counts[i]).collect();
         coverages.sort_unstable();
         let n = coverages.len();
         if n == 0 {
@@ -740,22 +767,22 @@ impl ErrorAnalyzer {
     /// those key indices to estimate the 5th–95th percentile confidence interval.
     ///
     /// Returns a vector of `(qscore, num_correct, num_error, error_rate, ci_lower, ci_upper)`.
-    pub fn calibrate_qscores(&self, stats: &KVmerStats) -> Vec<(u8, u64, u64, f64, f64, f64)> {
+    pub fn calibrate_qscores(&self, stats: &KVmerStats) -> Vec<QscoreCalibration> {
         // Filter outlier keys
         let indices = if !self.args.use_all {
             self.find_hazard_ratio_outliers(stats)
         } else {
-            (0..stats.consensus_counts.len()).collect()
+            (0..stats.error_summary.consensus_counts.len()).collect()
         };
 
         // Aggregate qscore counts from inlier keys
         let mut qscore_correct: HashMap<u8, u64> = HashMap::new();
         let mut qscore_error: HashMap<u8, u64> = HashMap::new();
         for &i in &indices {
-            for (&q, &c) in &stats.qscore_correct_per_key[i] {
+            for (&q, &c) in &stats.phred_summary.correct_per_key[i] {
                 *qscore_correct.entry(q).or_insert(0) += c;
             }
-            for (&q, &e) in &stats.qscore_error_per_key[i] {
+            for (&q, &e) in &stats.phred_summary.error_per_key[i] {
                 *qscore_error.entry(q).or_insert(0) += e;
             }
         }
@@ -774,10 +801,10 @@ impl ErrorAnalyzer {
             let mut c_sample: HashMap<u8, u64> = HashMap::new();
             let mut e_sample: HashMap<u8, u64> = HashMap::new();
             for &i in &sample {
-                for (&q, &c) in &stats.qscore_correct_per_key[i] {
+                for (&q, &c) in &stats.phred_summary.correct_per_key[i] {
                     *c_sample.entry(q).or_insert(0) += c;
                 }
-                for (&q, &e) in &stats.qscore_error_per_key[i] {
+                for (&q, &e) in &stats.phred_summary.error_per_key[i] {
                     *e_sample.entry(q).or_insert(0) += e;
                 }
             }
@@ -804,8 +831,67 @@ impl ErrorAnalyzer {
             let lower = if n > 0 { rates[(n as f64 * 0.05) as usize] } else { 0.0 };
             let upper = if n > 0 { rates[((n as f64 * 0.95) as usize).min(n - 1)] } else { 0.0 };
 
-            result.push((q, correct, error, error_rate, lower, upper));
+            result.push(QscoreCalibration { qscore: q, num_correct: correct, num_error: error, error_rate, ci_lower: lower, ci_upper: upper });
         }
+        result
+    }
+
+    /// Like `calibrate_qscores`, but aggregates correct/error counts by read position
+    /// (from start and from end) across inlier keys.  No bootstrap CI is computed
+    /// since the output does not include confidence intervals.
+    pub fn calibrate_read_positions(&self, stats: &KVmerStats) -> Vec<ReadPositionCalibration> {
+        let indices = if !self.args.use_all {
+            self.find_hazard_ratio_outliers(stats)
+        } else {
+            (0..stats.error_summary.consensus_counts.len()).collect()
+        };
+
+        let mut correct_from_start: HashMap<u32, u64> = HashMap::new();
+        let mut correct_from_end: HashMap<u32, u64> = HashMap::new();
+        let mut error_from_start: HashMap<u32, u64> = HashMap::new();
+        let mut error_from_end: HashMap<u32, u64> = HashMap::new();
+
+        for &i in &indices {
+            for (&pos, &c) in &stats.read_position_summary.correct_from_start_per_key[i] {
+                *correct_from_start.entry(pos).or_insert(0) += c;
+            }
+            for (&pos, &c) in &stats.read_position_summary.correct_from_end_per_key[i] {
+                *correct_from_end.entry(pos).or_insert(0) += c;
+            }
+            for (&pos, &e) in &stats.read_position_summary.error_from_start_per_key[i] {
+                *error_from_start.entry(pos).or_insert(0) += e;
+            }
+            for (&pos, &e) in &stats.read_position_summary.error_from_end_per_key[i] {
+                *error_from_end.entry(pos).or_insert(0) += e;
+            }
+        }
+
+        let mut result = Vec::new();
+
+        let mut start_positions: Vec<u32> = correct_from_start.keys().chain(error_from_start.keys()).copied().collect();
+        start_positions.sort_unstable();
+        start_positions.dedup();
+        for pos in start_positions {
+            result.push(ReadPositionCalibration {
+                index: pos,
+                from_start: true,
+                num_correct: *correct_from_start.get(&pos).unwrap_or(&0),
+                num_error: *error_from_start.get(&pos).unwrap_or(&0),
+            });
+        }
+
+        let mut end_positions: Vec<u32> = correct_from_end.keys().chain(error_from_end.keys()).copied().collect();
+        end_positions.sort_unstable();
+        end_positions.dedup();
+        for pos in end_positions {
+            result.push(ReadPositionCalibration {
+                index: pos,
+                from_start: false,
+                num_correct: *correct_from_end.get(&pos).unwrap_or(&0),
+                num_error: *error_from_end.get(&pos).unwrap_or(&0),
+            });
+        }
+
         result
     }
 
@@ -814,7 +900,7 @@ impl ErrorAnalyzer {
         let indices = if !self.args.use_all {
             self.find_hazard_ratio_outliers(stats)
         } else {
-            (0..stats.consensus_counts.len()).collect()
+            (0..stats.error_summary.consensus_counts.len()).collect()
         };
 
         // estimate SNP rates
@@ -827,24 +913,32 @@ impl ErrorAnalyzer {
         let per_base_error_rate = 1.0 - (-lambda).exp();
         let per_base_error_rate_ci = (1.0 - (-(lambda_ci.0)).exp(), 1.0 - (-(lambda_ci.1)).exp());
 
-        if let Some(hazard_ratio_output) = &self.args.hazard_rate {
+        if let Some(prefix) = &self.args.output_prefix {
+            use std::fs;
             use std::fs::File;
             use std::io::{BufWriter, Write};
 
-            let file = File::create(hazard_ratio_output).expect("Could not create hazard ratio output file.");
+            let hazard_ratio_output = format!("{}.hazard_rate.csv", prefix);
+            let file = File::create(&hazard_ratio_output).expect("Could not create hazard ratio output file.");
             let mut writer = BufWriter::new(file);
 
             writeln!(writer, "t,num_candidates,num_survival,hazard_ratio,5th_percentile,95th_percentile").expect("Could not write to hazard ratio output file.");
             for v in 0..hazard_ratio.len() {
-                writeln!(writer, "{},{},{},{:.6},{:.6},{:.6}", 
+                writeln!(writer, "{},{},{},{:.6},{:.6},{:.6}",
                     v + 1 + self.args.k as usize,
                     x_sum[v],
                     y_sum[v],
-                    hazard_ratio[v], 
-                    hazard_ratio_ci[v].0, 
+                    hazard_ratio[v],
+                    hazard_ratio_ci[v].0,
                     hazard_ratio_ci[v].1
                 ).expect("Could not write to hazard ratio output file.");
             }
+
+            fs::write(format!("{}.kvmer.csv", prefix), stats.error_summary.to_csv(Some(&indices))).unwrap();
+            fs::write(format!("{}.summary_error_spectrum.csv", prefix), stats.error_spectrum.to_csv(Some(&indices))).unwrap();
+            fs::write(format!("{}.summary_error_spectrum_dependence_on_t.csv", prefix), stats.error_spectrum.to_dependence_on_t_csv(Some(&indices), self.args.k as usize, self.args.ignore_last_hazard_ratios)).unwrap();
+            fs::write(format!("{}.summary_phred.csv", prefix), stats.phred_summary.to_csv(Some(&indices))).unwrap();
+            fs::write(format!("{}.summary_read_position.csv", prefix), stats.read_position_summary.to_csv(Some(&indices))).unwrap();
         }
 
         // estimate key coverage
@@ -889,16 +983,6 @@ pub fn spectrum_to_str(spectrum: &ErrorSpectrum, bidirectional: bool) -> String 
     result.push_str(&format!("{:.6},{:.6}~{:.6},", spectrum.key_coverage.0, (spectrum.key_coverage.1).0, (spectrum.key_coverage.1).1));
     result.push_str(&format!("{:.6},{:.6}~{:.6},", spectrum.estimated_coverage.0, (spectrum.estimated_coverage.1).0, (spectrum.estimated_coverage.1).1));
 
-    // SNP rates
-    for op in ALL_OPERATIONS.iter() {
-        for prev_base in 0..4 {
-            for next_base in 0..4 {
-                let count = spectrum.snp_rate.get(&(*op, prev_base, next_base)).unwrap_or(&0);
-                result.push_str(&format!("{},", count));
-            }
-        }
-    }
-
     // remove the last comma
     result.pop();
 
@@ -915,15 +999,7 @@ pub fn header_str(bidirectional: bool) -> String {
     result.push_str("beta,beta_5-95th_percentile,");
 
     result.push_str("key_median_coverage,key_coverage_5-95th_percentile,");
-    result.push_str("true_median_coverage,true_coverage_5-95th_percentile,");
-    for op in ALL_OPERATIONS.iter() {
-        for prev_base in 0..4 {
-            for next_base in 0..4 {
-                result.push_str(&sbs96_str(&(*op, prev_base, next_base)));
-                result.push(',');
-            }
-        }
-    }
+    result.push_str("true_median_coverage,true_coverage_5-95th_percentile");
 
     result
 }

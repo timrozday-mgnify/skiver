@@ -82,6 +82,7 @@ pub fn fmh_seeds_masked(
     string: &[u8],
     keys_vec: &mut Vec<u64>,
     values_vec: &mut Vec<u64>,
+    value_info_vec: &mut Vec<ValueInfo>,
     c: usize,
     k: usize,
     v: usize,
@@ -157,6 +158,7 @@ pub fn fmh_seeds_masked(
         if hash_f < threshold_marker {
             keys_vec.push(rolling_key_f as u64);
             values_vec.push(rolling_value_f as u64);
+            value_info_vec.push(ValueInfo { qual: vec![], start_index: (i - v + 1) as u32, dist_to_read_end: len as u32 - (i - v + 1) as u32, is_forward: true });
         }
 
         if bidirectional {
@@ -173,13 +175,14 @@ pub fn fmh_seeds_masked(
             rolling_key_r >>= 2;
             rolling_key_r |= nuc_r << (2 * (k - 1));
             rolling_key_r &= key_mask;
-            
 
-            
+
+
             let hash_r = mm_hash64_masked(rolling_key_r, None);
             if hash_r < threshold_marker {
                 keys_vec.push(rolling_key_r as u64);
                 values_vec.push(rolling_value_r as u64);
+                value_info_vec.push(ValueInfo { qual: vec![], start_index: (i - k + 1) as u32, dist_to_read_end: len as u32 - (i - k + 1) as u32, is_forward: false });
             }
         }
     }
@@ -199,7 +202,7 @@ pub fn fmh_seeds_masked_with_qual(
     qual: &[u8],
     keys_vec: &mut Vec<u64>,
     values_vec: &mut Vec<u64>,
-    quals_vec: &mut Vec<Vec<u8>>,
+    value_info_vec: &mut Vec<ValueInfo>,
     c: usize,
     k: usize,
     v: usize,
@@ -266,7 +269,7 @@ pub fn fmh_seeds_masked_with_qual(
             keys_vec.push(rolling_key_f);
             values_vec.push(rolling_value_f);
             // Value covers read positions [i-v+1, i]; position 0 = i-v+1.
-            quals_vec.push(qual[i - v + 1..=i].to_vec());
+            value_info_vec.push(ValueInfo { qual: qual[i - v + 1..=i].to_vec(), start_index: (i - v + 1) as u32, dist_to_read_end: len as u32 - (i - v + 1) as u32, is_forward: true });
         }
 
         if bidirectional {
@@ -288,7 +291,7 @@ pub fn fmh_seeds_masked_with_qual(
                 // RC value position p corresponds to forward read position (i-k-p).
                 // Quality string is in RC-value-position order: p=0 → qual[i-k].
                 let rc_qual: Vec<u8> = (0..v).map(|p| qual[i - k - p]).collect();
-                quals_vec.push(rc_qual);
+                value_info_vec.push(ValueInfo { qual: rc_qual, start_index: (i - k + 1) as u32, dist_to_read_end: len as u32 - (i - k + 1) as u32, is_forward: false });
             }
         }
     }
