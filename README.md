@@ -166,7 +166,17 @@ Apart from `plot_all.py`, you can also use the individual scripts and adjust the
     <img src="./figures/SRR7498042_qscore_calibration.png"/>
   </p> 
 
+- **Dependence of error rate on position in the read** (beta)
 
+  ```bash
+  python ./scripts/plot_read_position.py example/SRR7498042.summary_read_position.csv figures/SRR7498042_read_position.png
+  ```
+
+  will plot the estimated error rate at the positions close to the two ends of the read, which can help to decide how many bases to trim at each end.
+
+   <p align="center">
+    <img src="./figures/SRR7498042_read_position.png"/>
+  </p> 
 
 
 ## Contribution
