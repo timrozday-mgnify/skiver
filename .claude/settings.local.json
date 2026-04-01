@@ -10,7 +10,8 @@
       "Bash(conda env:*)",
       "Bash(pip3 list:*)",
       "Bash(grep -h \"^import\\\\|^from\" /Users/timrozday/Documents/skiver/scripts/*.py)",
-      "Bash(conda create:*)"
+      "Bash(conda create:*)",
+      "Bash(ls /Users/timrozday/Documents/skiver_run/mimicc_example/*.csv)"
     ]
   }
 }
