@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(chmod:*)",
+      "Bash(python -c \"import pyro; import torch; print\\(''pyro'', pyro.__version__, ''torch'', torch.__version__\\)\")",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(conda run:*)",
+      "Bash(conda env:*)",
+      "Bash(pip3 list:*)",
+      "Bash(grep -h \"^import\\\\|^from\" /Users/timrozday/Documents/skiver/scripts/*.py)",
+      "Bash(conda create:*)"
+    ]
+  }
+}

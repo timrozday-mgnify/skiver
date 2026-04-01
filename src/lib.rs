@@ -10,6 +10,7 @@ pub mod constants;
 pub mod mapping;
 pub mod huber;
 pub mod summary;
+pub mod dump;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2_seeding;

@@ -17,6 +17,10 @@ pub enum Mode {
     #[clap(display_order = 2)]
     Analyze(AnalyzeArgs),
 
+    /// Dump per-observation data useful for training HMM error models.
+    #[clap(display_order = 3)]
+    Dump(DumpArgs),
+
     /// For testing only: Try mapping the reads to reference genomes, and check how many k-mers are error-free.
     #[clap(display_order = 4)]
     Map(MapArgs),
@@ -146,3 +150,22 @@ pub struct MapArgs {
     pub print_verbose: bool,
 }
 
+#[derive(Args, Default)]
+pub struct DumpArgs {
+    /// All analysis parameters (files, -k, -v, -c, -r, -l, -o, etc.) are inherited from the
+    /// analyze subcommand. Use `skiver analyze -h` for full documentation of those flags.
+    #[clap(flatten)]
+    pub analyze: AnalyzeArgs,
+
+    #[clap(long, help_heading = "OUTPUT",
+           help = "Write {prefix}.raw_observations.tsv: one row per (key, value, occurrence).")]
+    pub raw: bool,
+
+    #[clap(long, help_heading = "OUTPUT",
+           help = "Write {prefix}.base_observations.tsv: one row per base position for 0-edit and 1-edit values (aligned to consensus).")]
+    pub base: bool,
+
+    #[clap(long, help_heading = "OUTPUT",
+           help = "Write {prefix}.survival_observations.tsv: one row per occurrence with first-error position.")]
+    pub survival: bool,
+}

@@ -5,6 +5,7 @@ use skiver::cmdline::*;
 use skiver::analyze;
 use skiver::sketch;
 use skiver::mapping;
+use skiver::dump;
 
 
 //Use this allocator when statically compiling
@@ -28,6 +29,7 @@ fn main() {
     match cli.mode {
         Mode::Sketch(sketch_args) => sketch::sketch(sketch_args),
         Mode::Analyze(analyze_args) => analyze::analyze(analyze_args),
+        Mode::Dump(dump_args) => dump::dump(dump_args),
         Mode::Map(map_args) => mapping::map(map_args),
     }
 }
