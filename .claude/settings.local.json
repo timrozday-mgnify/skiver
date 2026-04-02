@@ -11,7 +11,15 @@
       "Bash(pip3 list:*)",
       "Bash(grep -h \"^import\\\\|^from\" /Users/timrozday/Documents/skiver/scripts/*.py)",
       "Bash(conda create:*)",
-      "Bash(ls /Users/timrozday/Documents/skiver_run/mimicc_example/*.csv)"
+      "Bash(ls /Users/timrozday/Documents/skiver_run/mimicc_example/*.csv)",
+      "WebFetch(domain:academic.oup.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(pip list:*)",
+      "Bash(pip show:*)",
+      "Bash(python -c \"import pyro.distributions as dist; print\\(dist.DiscreteHMM.__init__.__doc__[:500] if dist.DiscreteHMM.__init__.__doc__ else ''''no doc''''\\)\")",
+      "Bash(ls /Users/timrozday/Documents/skiver_run/mimicc_example/*.kvmer)",
+      "Bash(cargo run:*)"
     ]
   }
 }

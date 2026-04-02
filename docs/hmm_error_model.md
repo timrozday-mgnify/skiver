@@ -358,7 +358,103 @@ For small datasets, add Dirichlet priors on emission and transition rows with
 
 ---
 
-## 7. How the components relate
+## 7. Profile HMM (context-dependent model)
+
+The basic HMM (§6) uses a flat 200-category emission encoding that is
+context-blind — it does not distinguish dinucleotide context, error type, or
+position within the value window. The **profile HMM** extends this with
+factored, context-dependent emissions inspired by PBSIM3's error-type HMM
+and Hercules' profile HMM (see `docs/pbsim3_reference.md` and
+`docs/hercules_reference.md`).
+
+### 7.1 Architecture
+
+S = 4 latent quality-regime states (configurable). Emissions are factored:
+
+**Component A — Error type:**
+```
+P(error_type | state, prev_base, true_base, position_t)
+```
+
+10 error types: match, 4 substitutions (to A/C/G/T), 4 insertions (A/C/G/T),
+1 deletion.
+
+Parameter shape: `error_type_logits[S, 16, T, 10]` — indexed by state,
+dinucleotide context (prev_base × true_base = 4×4 = 16), position, and
+error type.
+
+**Component B — Phred quality:**
+```
+P(phred_bin | error_class, state, position_t)
+```
+
+8 Phred bins (Q0–4, Q5–9, ..., Q35+), conditioned on 3 coarse error classes
+(match, mismatch, indel).
+
+Parameter shape: `phred_logits[S, 3, T, 8]`.
+
+**Joint log-probability:**
+```
+log P(obs | z_t, ctx_t) = log P(error_type | z_t, prev_base, true_base, t)
+                        + log P(phred_bin | error_class, z_t, t)
+```
+
+### 7.2 Dinucleotide context
+
+The `prev_base` column in `base_observations.tsv` provides the preceding base:
+- At t=1: the last base of the k-mer key
+- At t>1: the previous consensus base
+
+This is combined with `true_base` to form 16 dinucleotide contexts, enabling
+the model to capture context-dependent error patterns (e.g., C→T transitions
+are enriched in CpG context for oxidative damage).
+
+### 7.3 Parameter count
+
+With S=4, T=13, 16 contexts, 10 error types, 3 error classes, 8 Phred bins:
+- Initial logits: 4
+- Transition logits: 4 × 4 = 16
+- Error-type logits: 4 × 16 × 13 × 10 = 8,320
+- Phred logits: 4 × 3 × 13 × 8 = 1,248
+- **Total: ~9,588 parameters**
+
+### 7.4 Training
+
+Same SVI approach as the basic HMM. Key differences:
+- Uses `ClippedAdam` optimiser with gradient clipping
+- Stratified subsampling keeps all error-containing sequences; subsamples
+  error-free to 50:1 ratio (configurable)
+- Informative initialisation: match logit ~4, error logits ~-8 with per-state
+  offset for symmetry breaking
+- Default: 2000 SVI steps, lr=0.005
+
+### 7.5 Usage
+
+```bash
+# Train
+python scripts/train_profile_hmm.py \
+    ../skiver_run/mimicc_example/250700000051_25Nov5669-DL133_S133_L001_R1 \
+    -o profile_hmm.pt --states 4 --steps 2000
+
+# With both read pairs
+python scripts/train_profile_hmm.py prefix_R1 prefix_R2 \
+    -o profile_hmm.pt
+```
+
+### 7.6 Comparison with basic HMM
+
+| Feature | Basic HMM (§6) | Profile HMM (§7) |
+|---------|----------------|-------------------|
+| Emissions | 200 flat categories | Factored: 10 error types × 8 Phred bins |
+| Context | None | Dinucleotide (16 contexts) |
+| Position dependence | Only via Markov transitions | Explicit per-position emission parameters |
+| Error types | Implicit (true≠obs) | Explicit (sub/ins/del separated) |
+| Parameters | ~600 (S=3) | ~9,600 (S=4) |
+| Script | `train_hmm_error_model.py` | `train_profile_hmm.py` |
+
+---
+
+## 8. How the components relate
 
 ```
 skiver analyze → summary_error_rate.csv      (scalar λ, β, per-base error rate)
@@ -368,9 +464,11 @@ skiver analyze → summary_error_rate.csv      (scalar λ, β, per-base error ra
                   dependence_on_t.csv
               → summary_read_position.csv    (how error rate varies along the read)
 
-skiver dump --base → base_observations.tsv
-    → train_hmm_error_model.py → hmm_error_model.pt
-                                 (latent quality regimes, per-state spectra)
+skiver dump --base → base_observations.tsv (with prev_base column)
+    → train_hmm_error_model.py  → hmm_error_model.pt
+                                  (basic: latent quality regimes, per-state spectra)
+    → train_profile_hmm.py      → profile_hmm.pt
+                                  (context-dependent: dinucleotide, position, error type)
 ```
 
 The components answer complementary questions:
@@ -392,11 +490,18 @@ The components answer complementary questions:
 
 | File | Role |
 |------|------|
-| `scripts/train_hmm_error_model.py` | CLI: train HMM from `base_observations.tsv` |
+| `scripts/train_hmm_error_model.py` | CLI: train basic HMM from `base_observations.tsv` |
+| `scripts/train_profile_hmm.py` | CLI: train profile HMM with context-dependent emissions |
+| `scripts/lib/encoding.py` | Observation encoding: error types, context indexing |
+| `scripts/lib/data_loading.py` | TSV loader, stratified subsampling, tensor construction |
+| `scripts/lib/profile_hmm.py` | Pyro model: factored emission distribution, training |
+| `scripts/lib/validation.py` | Comparison routines against summary CSVs |
 | `notebooks/hmm_error_model.ipynb` | Interactive training, data exploration, plots |
 | `scripts/plot_qscore_calibration.py` | Plot empirical vs. theoretical Phred calibration |
 | `scripts/plot_spectrum.py` | Plot 5×5 substitution matrix (scaled to error rate) |
 | `scripts/plot_sbs96_spectrum.py` | Plot SBS96 trinucleotide substitution spectrum |
 | `scripts/plot_read_position.py` | Plot error rate vs. position from read start/end |
 | `docs/hmm_error_model.md` | This document |
+| `docs/pbsim3_reference.md` | PBSIM3 error model design reference |
+| `docs/hercules_reference.md` | Hercules profile HMM design reference |
 | `docs/paper_reference.md` | Mathematical reference: Weibull survival model |

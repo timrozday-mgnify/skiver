@@ -92,6 +92,7 @@ Indel alignment convention (`edit_t` = 1-based left-to-right position of the edi
 | t | u8 | 1-based left-to-right position in the value (1..=v) |
 | true\_base | char | ACGT from consensus, or `-` at an insertion position |
 | obs\_base | char | ACGT from observed value, or `-` at a deletion position |
+| prev\_base | char | ACGT: preceding base (last key base at t=1, consensus[t-1] otherwise) |
 | edit\_op | str | Operation name (`C>T`, `->A`, `G>-`) or `NA` for match |
 | phred | i32 | Integer Phred quality (qual byte − 33); −1 if unavailable or deletion |
 | read\_pos | i64 | Absolute 0-based position of this base in the read (`start_index + t − 1`) |

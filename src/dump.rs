@@ -44,6 +44,19 @@ fn base_at(kmer: u64, t: u8, v: u8) -> u8 {
     ((kmer >> ((v - t) * 2)) & 0b11) as u8
 }
 
+/// Return the preceding base character for position `t` (1-based) in the value.
+/// At t=1, the preceding base is the last base of the key.
+/// At t>1, the preceding base is the consensus base at t-1.
+#[inline]
+fn prev_base_ch(key: u64, k: u8, consensus: u64, v: u8, t: u8) -> char {
+    let idx = if t == 1 {
+        base_at(key, k, k) as usize
+    } else {
+        base_at(consensus, t - 1, v) as usize
+    };
+    SEQ_TO_CHAR[idx]
+}
+
 /// Return the integer Phred score (qual byte minus 33) at 0-based index `idx`,
 /// or -1 if quality data is absent or the index is out of range.
 #[inline]
@@ -148,7 +161,9 @@ fn read_pos(info: &ValueInfo, t: u8) -> i64 {
 fn write_base_rows(
     writer: &mut Option<BufWriter<File>>,
     obs_id: u64,
+    k: u8,
     v: u8,
+    key: u64,
     consensus: u64,
     obs_value: u64,
     class: &ObsClass,
@@ -172,8 +187,10 @@ fn write_base_rows(
                 let ch = SEQ_TO_CHAR[b];
                 writeln!(
                     w,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    obs_id, t, ch, ch, "NA",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    obs_id, t, ch, ch,
+                    prev_base_ch(key, k, consensus, v, t),
+                    "NA",
                     phred_at(info, (t - 1) as usize),
                     read_pos(info, t),
                     info.dist_to_read_end,
@@ -199,9 +216,10 @@ fn write_base_rows(
                     let edit_op = if t == edit_t { format!("{}", op) } else { "NA".into() };
                     writeln!(
                         w,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         obs_id, t,
                         SEQ_TO_CHAR[true_b], SEQ_TO_CHAR[obs_b],
+                        prev_base_ch(key, k, consensus, v, t),
                         edit_op,
                         phred_at(info, (t - 1) as usize),
                         read_pos(info, t),
@@ -240,8 +258,10 @@ fn write_base_rows(
                     };
                     writeln!(
                         w,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        obs_id, t, true_ch, obs_ch, edit_op_str,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        obs_id, t, true_ch, obs_ch,
+                        prev_base_ch(key, k, consensus, v, t),
+                        edit_op_str,
                         phred,
                         read_pos(info, t),
                         info.dist_to_read_end,
@@ -280,8 +300,10 @@ fn write_base_rows(
                     };
                     writeln!(
                         w,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        obs_id, t, true_ch, obs_ch, edit_op_str,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        obs_id, t, true_ch, obs_ch,
+                        prev_base_ch(key, k, consensus, v, t),
+                        edit_op_str,
                         phred,
                         read_pos(info, t),
                         info.dist_to_read_end,
@@ -455,7 +477,7 @@ pub fn dump(args: DumpArgs) {
     if let Some(ref mut w) = base_writer {
         writeln!(
             w,
-            "obs_id\tt\ttrue_base\tobs_base\tedit_op\tphred\tread_pos\t\
+            "obs_id\tt\ttrue_base\tobs_base\tprev_base\tedit_op\tphred\tread_pos\t\
              dist_to_end\tis_forward\tpasses_filter"
         )
         .unwrap();
@@ -515,7 +537,9 @@ pub fn dump(args: DumpArgs) {
                 write_base_rows(
                     &mut base_writer,
                     obs_id,
+                    k,
                     v,
+                    key,
                     consensus,
                     obs_value,
                     &class,
