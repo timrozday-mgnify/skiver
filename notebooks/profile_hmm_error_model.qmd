@@ -1,0 +1,448 @@
+---
+title: Profile HMM Error Model
+jupyter: skiver
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  execute-dir: file
+---
+
+
+Trains a context-dependent profile HMM on per-base observations from `skiver dump --base`.
+Emissions are factored into **error type** (10 categories, conditioned on dinucleotide context
+and position) and **Phred quality** (8 bins, conditioned on error class and position).
+
+See `docs/hmm_error_model.md` §7 for architecture details.
+
+
+## 1. Setup
+
+```{python}
+from __future__ import annotations
+
+import csv
+import logging
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
+import torch.nn.functional as F
+
+import pyro
+import pyro.distributions as dist
+
+# Add scripts/ to path so we can import lib modules.
+sys.path.insert(0, str(Path("../scripts").resolve()))
+
+from lib.encoding import (
+    BASE_TO_IDX, NUM_BASES, NUM_ERROR_TYPES, NUM_PHRED_BINS,
+    NUM_ERROR_CLASSES, ERROR_TYPE_MATCH, ERROR_TYPE_TO_CLASS_TENSOR,
+    encode_error_type, encode_context, bin_phred, error_type_to_class,
+)
+from lib.data_loading import (
+    SequenceData, load_base_observations, stratified_subsample, build_tensors,
+)
+from lib.profile_hmm import (
+    ProfileEmission, gather_error_logits, gather_phred_logits,
+    pack_observations, profile_hmm_model, profile_hmm_guide,
+    train, marginal_error_rate, stationary_distribution,
+    _init_error_type_logits, _init_phred_logits,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+%matplotlib inline
+plt.rcParams["figure.dpi"] = 120
+sns.set_style("whitegrid")
+```
+
+## 2. Load data
+
+Point `PREFIXES` at one or more `skiver dump --base` output prefixes.
+The base_observations.tsv must include the `prev_base` column (re-run `skiver dump` if needed).
+
+```{python}
+# ── Configure paths here ─────────────────────────────────────────────────────
+RUN_DIR = Path("../../skiver_run/mimicc_example")
+SAMPLE = "250700000051_25Nov5669-DL133_S133_L001_R1"
+
+PREFIXES = [
+    str(RUN_DIR / SAMPLE),
+]
+
+sequences = []
+for prefix in PREFIXES:
+    sequences.extend(load_base_observations(prefix, passes_filter_only=True))
+
+print(f"Loaded {len(sequences)} sequences")
+n_with_error = sum(1 for s in sequences if s.has_error)
+print(f"  With errors: {n_with_error}")
+print(f"  Error-free:  {len(sequences) - n_with_error}")
+if sequences:
+    print(f"  Error rate:  {n_with_error / len(sequences):.4%}")
+```
+
+## 3. Data exploration
+
+```{python}
+# ── Error type distribution ───────────────────────────────────────────────────
+ERROR_TYPE_NAMES = [
+    "match", "sub→A", "sub→C", "sub→G", "sub→T",
+    "ins A", "ins C", "ins G", "ins T", "deletion",
+]
+
+error_type_counts = Counter()
+for seq in sequences:
+    error_type_counts.update(seq.error_type)
+
+fig, ax = plt.subplots(figsize=(10, 4))
+types = list(range(NUM_ERROR_TYPES))
+counts = [error_type_counts.get(t, 0) for t in types]
+ax.bar(types, counts, color=["#2ecc71"] + ["#e74c3c"] * 4 + ["#3498db"] * 4 + ["#9b59b6"])
+ax.set_xticks(types)
+ax.set_xticklabels(ERROR_TYPE_NAMES, rotation=45, ha="right")
+ax.set_ylabel("Count")
+ax.set_title("Error type distribution (all positions)")
+ax.set_yscale("log")
+plt.tight_layout()
+plt.show()
+
+# Print counts
+total = sum(counts)
+for t, name in enumerate(ERROR_TYPE_NAMES):
+    print(f"  {name:10s}: {counts[t]:8d}  ({counts[t]/total:.6%})")
+```
+
+```{python}
+# ── Error rate by dinucleotide context ────────────────────────────────────────
+IDX_TO_BASE = {v: k for k, v in BASE_TO_IDX.items()}
+
+context_errors = defaultdict(lambda: [0, 0])  # {context_str: [n_errors, n_total]}
+for seq in sequences:
+    for et, ci in zip(seq.error_type, seq.context_idx):
+        pb = ci // NUM_BASES
+        tb = ci % NUM_BASES
+        ctx = IDX_TO_BASE[pb] + IDX_TO_BASE[tb]
+        context_errors[ctx][1] += 1
+        if et != ERROR_TYPE_MATCH:
+            context_errors[ctx][0] += 1
+
+ctx_df = pd.DataFrame([
+    {"context": ctx, "errors": v[0], "total": v[1], "error_rate": v[0] / v[1] if v[1] > 0 else 0}
+    for ctx, v in sorted(context_errors.items())
+])
+
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.bar(range(len(ctx_df)), ctx_df["error_rate"])
+ax.set_xticks(range(len(ctx_df)))
+ax.set_xticklabels(ctx_df["context"], rotation=45, ha="right")
+ax.set_ylabel("Error rate")
+ax.set_title("Error rate by dinucleotide context (prev_base + true_base)")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Error rate by position in value window ────────────────────────────────────
+v = len(sequences[0].error_type)
+pos_errors = np.zeros(v)
+pos_total = np.zeros(v)
+
+for seq in sequences:
+    for t_idx, et in enumerate(seq.error_type):
+        pos_total[t_idx] += 1
+        if et != ERROR_TYPE_MATCH:
+            pos_errors[t_idx] += 1
+
+pos_rate = pos_errors / np.maximum(pos_total, 1)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(range(1, v + 1), pos_rate)
+ax.set_xlabel("Position t in value window")
+ax.set_ylabel("Error rate")
+ax.set_title(f"Error rate by position (v={v})")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Phred distribution by error class ─────────────────────────────────────────
+ERROR_CLASS_NAMES = ["match", "mismatch", "indel"]
+class_phred = defaultdict(list)
+
+for seq in sequences:
+    for et, pb in zip(seq.error_type, seq.phred_bin):
+        ec = error_type_to_class(et)
+        class_phred[ERROR_CLASS_NAMES[ec]].append(pb)
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
+PHRED_LABELS = [f"Q{i*5}-{i*5+4}" for i in range(NUM_PHRED_BINS - 1)] + ["Q35+"]
+for ax, cls_name in zip(axes, ERROR_CLASS_NAMES):
+    bins = class_phred.get(cls_name, [])
+    if bins:
+        counts_arr = np.bincount(bins, minlength=NUM_PHRED_BINS)
+        ax.bar(range(NUM_PHRED_BINS), counts_arr / counts_arr.sum())
+    ax.set_xticks(range(NUM_PHRED_BINS))
+    ax.set_xticklabels(PHRED_LABELS, rotation=45, ha="right", fontsize=8)
+    ax.set_title(cls_name)
+    ax.set_ylabel("Fraction" if ax == axes[0] else "")
+fig.suptitle("Phred bin distribution by error class")
+plt.tight_layout()
+plt.show()
+```
+
+## 4. Stratified subsampling and tensor construction
+
+```{python}
+SUBSAMPLE_RATIO = 50.0  # max error-free / error ratio
+
+subsampled = stratified_subsample(sequences, max_no_error_ratio=SUBSAMPLE_RATIO)
+batch = build_tensors(subsampled)
+packed_obs = pack_observations(batch.error_type, batch.phred_bin)
+
+print(f"Sequences after subsampling: {packed_obs.shape[0]}")
+print(f"Value length v = {batch.v}")
+print(f"packed_obs shape: {packed_obs.shape}")
+print(f"context_idx shape: {batch.context_idx.shape}")
+```
+
+## 5. Emission initialisation
+
+Inspect the initial parameter values before training.
+
+```{python}
+NUM_STATES = 4
+
+init_error_logits = _init_error_type_logits(NUM_STATES, batch.v)
+init_phred_logits = _init_phred_logits(NUM_STATES, batch.v)
+
+print(f"error_type_logits shape: {init_error_logits.shape}  (S, 16ctx, T, 10err)")
+print(f"phred_logits shape:      {init_phred_logits.shape}  (S, 3cls, T, 8phred)")
+
+# Show initial error type probabilities for state 0, context AA, position 1
+probs = F.softmax(init_error_logits[0, 0, 0, :], dim=-1)
+print("\nInitial P(error_type | state=0, ctx=AA, t=1):")
+for i, name in enumerate(ERROR_TYPE_NAMES):
+    print(f"  {name:10s}: {probs[i]:.6f}")
+```
+
+## 6. Train
+
+```{python}
+# ── Training hyperparameters ──────────────────────────────────────────────────
+RUN_TRAINING = False
+OUTPUT_PATH = Path("profile_hmm.pt")
+LR = 0.005
+NUM_STEPS = 2000
+CLIP_NORM = 10.0
+
+if RUN_TRAINING or not OUTPUT_PATH.exists():
+    params = train(
+        packed_obs,
+        batch.context_idx,
+        num_states=NUM_STATES,
+        v=batch.v,
+        lr=LR,
+        num_steps=NUM_STEPS,
+        clip_norm=CLIP_NORM,
+        log_every=100,
+    )
+else:
+    params = torch.load(OUTPUT_PATH, weights_only=True)
+    print(f"Loaded saved model parameters from {OUTPUT_PATH.resolve()}")
+    print("Set RUN_TRAINING = True to retrain instead of loading the saved model.")
+```
+
+```{python}
+# ── Training loss curve ───────────────────────────────────────────────────────
+losses = params["_losses"].numpy()
+per_seq_losses = losses / packed_obs.shape[0]
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+ax1.plot(losses)
+ax1.set_xlabel("Step")
+ax1.set_ylabel("Total loss")
+ax1.set_title("Training loss")
+
+ax2.plot(per_seq_losses)
+ax2.set_xlabel("Step")
+ax2.set_ylabel("Loss per sequence")
+ax2.set_title("Per-sequence loss")
+
+plt.tight_layout()
+plt.show()
+
+print(f"Final per-sequence loss: {per_seq_losses[-1]:.4f}")
+```
+
+## 7. Inspect learned parameters
+
+```{python}
+# ── Initial state probabilities ───────────────────────────────────────────────
+pi = stationary_distribution(params)
+print("Initial state probabilities:")
+for s in range(NUM_STATES):
+    print(f"  State {s}: {pi[s]:.4f}")
+
+# ── Transition matrix ────────────────────────────────────────────────────────
+trans = torch.softmax(params["transition_logits"], dim=-1)
+
+fig, ax = plt.subplots(figsize=(5, 4))
+sns.heatmap(trans.numpy(), annot=True, fmt=".3f", cmap="Blues",
+            xticklabels=[f"S{i}" for i in range(NUM_STATES)],
+            yticklabels=[f"S{i}" for i in range(NUM_STATES)], ax=ax)
+ax.set_xlabel("To state")
+ax.set_ylabel("From state")
+ax.set_title("Transition matrix")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Per-state error rate ──────────────────────────────────────────────────────
+err_rates = marginal_error_rate(params)
+print("Per-state error rate (marginalised over contexts and positions):")
+for s in range(NUM_STATES):
+    print(f"  State {s}: {err_rates[s]:.6f}  ({err_rates[s]*100:.4f}%)")
+
+weighted = (pi * err_rates).sum()
+print(f"\nWeighted average: {weighted:.6f}  ({weighted*100:.4f}%)")
+```
+
+```{python}
+# ── Error type distribution per state (averaged over contexts and positions) ──
+error_logits = params["error_type_logits"]  # [S, 16, T, 10]
+error_probs = F.softmax(error_logits, dim=-1)
+avg_error_probs = error_probs.mean(dim=(1, 2))  # [S, 10]
+
+fig, axes = plt.subplots(1, NUM_STATES, figsize=(4 * NUM_STATES, 4), sharey=True)
+if NUM_STATES == 1:
+    axes = [axes]
+for s, ax in enumerate(axes):
+    probs_s = avg_error_probs[s].numpy()
+    colors = ["#2ecc71"] + ["#e74c3c"] * 4 + ["#3498db"] * 4 + ["#9b59b6"]
+    ax.bar(range(NUM_ERROR_TYPES), probs_s, color=colors)
+    ax.set_xticks(range(NUM_ERROR_TYPES))
+    ax.set_xticklabels(ERROR_TYPE_NAMES, rotation=60, ha="right", fontsize=7)
+    ax.set_title(f"State {s}\n(π={pi[s]:.3f}, err={err_rates[s]:.5f})")
+    ax.set_ylabel("Probability" if s == 0 else "")
+fig.suptitle("Error type distribution per state (context-averaged)", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Context-dependent error rate heatmap (state 0) ───────────────────────────
+# Show error rate as a 4×4 heatmap: prev_base × true_base, for the dominant state.
+dominant_state = pi.argmax().item()
+
+error_rate_by_ctx = 1.0 - F.softmax(error_logits[dominant_state], dim=-1)[:, :, 0]  # [16, T]
+# Average over positions
+avg_by_ctx = error_rate_by_ctx.mean(dim=-1).numpy()  # [16]
+
+heatmap_data = avg_by_ctx.reshape(NUM_BASES, NUM_BASES)
+bases = ["A", "C", "G", "T"]
+
+fig, ax = plt.subplots(figsize=(5, 4))
+sns.heatmap(heatmap_data, annot=True, fmt=".5f", cmap="YlOrRd",
+            xticklabels=bases, yticklabels=bases, ax=ax)
+ax.set_xlabel("True base")
+ax.set_ylabel("Previous base")
+ax.set_title(f"Error rate by dinucleotide context (state {dominant_state}, position-averaged)")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Position-dependent error rate per state ───────────────────────────────────
+# error rate at each position, averaged over contexts
+pos_error_by_state = (1.0 - F.softmax(error_logits, dim=-1)[:, :, :, 0]).mean(dim=1)  # [S, T]
+
+fig, ax = plt.subplots(figsize=(8, 4))
+for s in range(NUM_STATES):
+    ax.plot(range(1, batch.v + 1), pos_error_by_state[s].numpy(),
+            marker="o", markersize=4, label=f"State {s} (π={pi[s]:.3f})")
+ax.set_xlabel("Position t in value window")
+ax.set_ylabel("Error rate")
+ax.set_title("Model: position-dependent error rate per state")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Phred distribution per state (match class) ───────────────────────────────
+phred_logits = params["phred_logits"]  # [S, 3, T, 8]
+phred_probs = F.softmax(phred_logits, dim=-1)
+# Average over positions, show match class (index 0)
+match_phred = phred_probs[:, 0, :, :].mean(dim=1)  # [S, 8]
+
+fig, ax = plt.subplots(figsize=(8, 4))
+x = np.arange(NUM_PHRED_BINS)
+width = 0.8 / NUM_STATES
+for s in range(NUM_STATES):
+    ax.bar(x + s * width, match_phred[s].numpy(), width,
+           label=f"State {s}", alpha=0.8)
+ax.set_xticks(x + width * (NUM_STATES - 1) / 2)
+ax.set_xticklabels(PHRED_LABELS, rotation=45, ha="right")
+ax.set_ylabel("Probability")
+ax.set_title("Phred distribution per state (match class, position-averaged)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## 8. Validation against summary CSVs
+
+```{python}
+from lib.validation import compare_error_rate, compare_substitution_spectrum
+
+# Compare overall error rate
+prefix = PREFIXES[0]
+er = compare_error_rate(params, prefix)
+if er:
+    print(f"Model error rate:   {er['model_error_rate']:.6f}")
+    print(f"Summary error rate: {er['summary_error_rate']:.6f}")
+    print(f"Ratio:              {er['ratio']:.3f}")
+```
+
+```{python}
+# Compare substitution spectrum
+print("Substitution spectrum comparison:")
+print(f"  {'Operation':>8s}  {'Model rate':>12s}  {'Summary count':>14s}")
+print(f"  {'─'*8:>8s}  {'─'*12:>12s}  {'─'*14:>14s}")
+spectrum = compare_substitution_spectrum(params, prefix)
+for op, vals in sorted(spectrum.items()):
+    print(f"  {op:>8s}  {vals['model']:12.6f}  {vals['summary']:14.0f}")
+```
+
+## 9. Save / Load model
+
+```{python}
+torch.save(params, OUTPUT_PATH)
+print(f"Saved model to {OUTPUT_PATH}")
+print(f"Parameters: {list(k for k in params if not k.startswith('_'))}")
+print(f"Metadata: num_states={int(params['_num_states'])}, v={int(params['_v'])}")
+```
+
+```{python}
+# ── Reload a saved model ──────────────────────────────────────────────────────
+# loaded = torch.load("profile_hmm.pt", weights_only=True)
+# print(f"Loaded: states={int(loaded['_num_states'])}, v={int(loaded['_v'])}")
+# print(f"Keys: {[k for k in loaded if not k.startswith('_')]}")
+```

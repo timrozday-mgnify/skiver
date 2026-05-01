@@ -1,0 +1,693 @@
+---
+title: HMM Error Model Training
+jupyter: skiver
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  execute-dir: file
+---
+
+
+Trains a discrete Hidden Markov Model on per-base observations from `skiver dump --base` output.
+
+Each position in a (k,v)-mer value window emits an observation `(true_base, obs_base, phred_bin)` encoded as a single integer category. Hidden states capture latent error-propensity regimes along the read.
+
+
+## 1. Setup
+
+```{python}
+from __future__ import annotations
+
+import csv
+import logging
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
+import pyro
+import pyro.distributions as dist
+import seaborn as sns
+import torch
+from pyro.infer import SVI, Trace_ELBO
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+logger = logging.getLogger(__name__)
+
+# Plotting defaults
+sns.set_theme(style="whitegrid", palette="muted")
+plt.rcParams["figure.dpi"] = 120
+```
+
+## 2. Constants and encoding
+
+```{python}
+BASE_TO_IDX: dict[str, int] = {"A": 0, "C": 1, "G": 2, "T": 3, "-": 4}
+IDX_TO_BASE: dict[int, str] = {v: k for k, v in BASE_TO_IDX.items()}
+
+NUM_BASES = 5          # A, C, G, T, gap
+NUM_PHRED_BINS = 8     # 0-4, 5-9, 10-14, 15-19, 20-24, 25-29, 30-34, 35+
+NUM_OBS_CATEGORIES = NUM_BASES * NUM_BASES * NUM_PHRED_BINS  # 200
+
+PHRED_BIN_LABELS = [f"Q{i*5}-{i*5+4}" if i < NUM_PHRED_BINS - 1 else f"Q{i*5}+"
+                    for i in range(NUM_PHRED_BINS)]
+
+print(f"Observation categories: {NUM_OBS_CATEGORIES}")
+print(f"Phred bins: {PHRED_BIN_LABELS}")
+
+
+def bin_phred(phred: int) -> int:
+    """Bin a phred score into NUM_PHRED_BINS categories."""
+    if phred < 0:
+        return 0
+    return min(phred // 5, NUM_PHRED_BINS - 1)
+
+
+def encode_obs(true_base: str, obs_base: str, phred: int) -> int:
+    """Encode (true_base, obs_base, phred) as a flat category index."""
+    tb = BASE_TO_IDX.get(true_base, 4)
+    ob = BASE_TO_IDX.get(obs_base, 4)
+    pb = bin_phred(phred)
+    return tb * NUM_BASES * NUM_PHRED_BINS + ob * NUM_PHRED_BINS + pb
+
+
+def decode_category(cat: int) -> tuple[str, str, str]:
+    """Decode a flat category index to (true_base, obs_base, phred_bin_label)."""
+    pb = cat % NUM_PHRED_BINS
+    remainder = cat // NUM_PHRED_BINS
+    ob = remainder % NUM_BASES
+    tb = remainder // NUM_BASES
+    lo = pb * 5
+    hi = "+" if pb == NUM_PHRED_BINS - 1 else str(lo + 4)
+    return IDX_TO_BASE[tb], IDX_TO_BASE[ob], f"Q{lo}-{hi}"
+
+
+# Sanity check: round-trip a few examples
+for tb, ob, phred in [("A", "A", 37), ("C", "T", 22), ("-", "G", 30)]:
+    cat = encode_obs(tb, ob, phred)
+    tb2, ob2, ql = decode_category(cat)
+    print(f"  ({tb},{ob},Q{phred}) → cat={cat} → ({tb2},{ob2},{ql})")
+```
+
+## 3. Data loading
+
+Point `PREFIXES` at one or more `skiver dump --base` output prefixes.
+
+```{python}
+# ── Configure paths here ─────────────────────────────────────────────────────
+RUN_DIR = Path("../../skiver_run/mimicc_example")
+SAMPLE  = "250700000051_25Nov5669-DL133_S133_L001"
+
+PREFIXES = [
+    RUN_DIR / f"{SAMPLE}_R1",
+    RUN_DIR / f"{SAMPLE}_R2",
+]
+
+PASSES_FILTER_ONLY = True   # set False to include outlier keys
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def load_base_observations(
+    prefix: str | Path,
+    *,
+    passes_filter_only: bool = True,
+) -> tuple[list[torch.Tensor], pd.DataFrame]:
+    """Load base_observations.tsv.
+
+    Returns:
+        sequences: list of 1-D long tensors, one per (key, value) occurrence.
+        df: the raw DataFrame for inspection.
+    """
+    path = Path(f"{prefix}.base_observations.tsv")
+    if not path.exists():
+        logger.warning("File not found: %s", path)
+        return [], pd.DataFrame()
+
+    df = pd.read_csv(path, sep="\t")
+    if passes_filter_only:
+        df = df[df["passes_filter"]].copy()
+
+    # Encode each row
+    df["encoded"] = df.apply(
+        lambda r: encode_obs(r["true_base"], r["obs_base"], int(r["phred"])),
+        axis=1,
+    )
+
+    sequences = [
+        torch.tensor(grp["encoded"].tolist(), dtype=torch.long)
+        for _, grp in df.groupby("obs_id", sort=False)
+    ]
+    logger.info("Loaded %d sequences from %s", len(sequences), path)
+    return sequences, df
+
+
+all_sequences: list[torch.Tensor] = []
+all_dfs: list[pd.DataFrame] = []
+
+for prefix in PREFIXES:
+    seqs, df = load_base_observations(prefix, passes_filter_only=PASSES_FILTER_ONLY)
+    all_sequences.extend(seqs)
+    all_dfs.append(df)
+
+combined_df = pd.concat(all_dfs, ignore_index=True)
+print(f"\nTotal sequences: {len(all_sequences)}")
+print(f"Total base observations: {len(combined_df)}")
+combined_df.head()
+```
+
+## 4. Data exploration
+
+```{python}
+# ── Sequence length distribution ──────────────────────────────────────────────
+seq_lengths = [s.shape[0] for s in all_sequences]
+length_counts = Counter(seq_lengths)
+print("Sequence length distribution (value length v):")
+for length, count in sorted(length_counts.items()):
+    print(f"  v={length}: {count} sequences")
+```
+
+```{python}
+# ── Overall error rate ────────────────────────────────────────────────────────
+combined_df["is_error"] = combined_df["true_base"] != combined_df["obs_base"]
+total = len(combined_df)
+errors = combined_df["is_error"].sum()
+print(f"Total bases:  {total:,}")
+print(f"Errors:       {errors:,}")
+print(f"Error rate:   {errors / total:.4%}")
+```
+
+```{python}
+# ── Phred score distribution ──────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+# All bases
+phred_vals = combined_df.loc[combined_df["phred"] >= 0, "phred"]
+axes[0].hist(phred_vals, bins=range(0, 45), edgecolor="white", linewidth=0.5)
+axes[0].set_xlabel("Phred score")
+axes[0].set_ylabel("Count")
+axes[0].set_title("Phred distribution — all bases")
+
+# Matches vs errors
+for label, mask, color in [
+    ("match", ~combined_df["is_error"], "steelblue"),
+    ("error", combined_df["is_error"], "crimson"),
+]:
+    sub = combined_df.loc[mask & (combined_df["phred"] >= 0), "phred"]
+    axes[1].hist(sub, bins=range(0, 45), alpha=0.7, label=label, color=color,
+                 edgecolor="white", linewidth=0.5, density=True)
+axes[1].set_xlabel("Phred score")
+axes[1].set_ylabel("Density")
+axes[1].set_title("Phred distribution — match vs error")
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Error rate by position in value window ────────────────────────────────────
+pos_stats = combined_df.groupby("t")["is_error"].agg(["mean", "sum", "count"]).reset_index()
+pos_stats.columns = ["t", "error_rate", "errors", "total"]
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(pos_stats["t"], pos_stats["error_rate"] * 100, color="steelblue", edgecolor="white")
+ax.set_xlabel("Position in value (t, 1-based)")
+ax.set_ylabel("Error rate (%)")
+ax.set_title("Per-position error rate within the value window")
+ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f%%"))
+plt.tight_layout()
+plt.show()
+
+print(pos_stats.to_string(index=False))
+```
+
+```{python}
+# ── Error rate by phred bin ───────────────────────────────────────────────────
+combined_df["phred_bin"] = combined_df["phred"].apply(bin_phred)
+phred_stats = combined_df.groupby("phred_bin")["is_error"].agg(["mean", "sum", "count"]).reset_index()
+phred_stats["label"] = phred_stats["phred_bin"].apply(lambda i: PHRED_BIN_LABELS[i])
+
+fig, ax = plt.subplots(figsize=(9, 4))
+bars = ax.bar(phred_stats["label"], phred_stats["mean"] * 100, color="teal", edgecolor="white")
+ax.set_xlabel("Phred bin")
+ax.set_ylabel("Observed error rate (%)")
+ax.set_title("Observed error rate per phred quality bin")
+ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f%%"))
+# Annotate bar counts
+for bar, count in zip(bars, phred_stats["count"]):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+            f"{count:,}", ha="center", va="bottom", fontsize=7, rotation=45)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Substitution matrix ───────────────────────────────────────────────────────
+bases = list("ACGT")
+error_df = combined_df[combined_df["is_error"] &
+                        combined_df["true_base"].isin(bases) &
+                        combined_df["obs_base"].isin(bases)]
+
+subst_counts = pd.crosstab(error_df["true_base"], error_df["obs_base"])
+subst_counts = subst_counts.reindex(index=bases, columns=bases, fill_value=0)
+
+fig, ax = plt.subplots(figsize=(5, 4))
+sns.heatmap(subst_counts, annot=True, fmt="d", cmap="Reds", ax=ax,
+            linewidths=0.5, cbar_kws={"label": "count"})
+ax.set_xlabel("Observed base")
+ax.set_ylabel("True base (consensus)")
+ax.set_title("Error substitution matrix (counts)")
+plt.tight_layout()
+plt.show()
+```
+
+## 5. Emission initialisation
+
+A key challenge: the true error rate is ~0.07%, so uniform emission initialisation (logit 0 everywhere) starts the model predicting ~60% error per state. We initialise match categories with high logits (scaled by phred bin) and mismatch categories with low logits, with slight per-state variation to break symmetry.
+
+```{python}
+NUM_STATES = 3  # change as needed
+
+
+def init_emission_logits(num_states: int) -> torch.Tensor:
+    """Emission logits initialised to strongly favour match categories.
+
+    Match categories get logit = phred_bin (higher quality → higher logit).
+    Mismatch categories get logit = -8 + state_idx, providing symmetry breaking
+    so states can specialise to different error-propensity regimes.
+    """
+    k = NUM_OBS_CATEGORIES
+    logits = torch.full((num_states, k), -10.0)
+    for cat in range(k):
+        pb = cat % NUM_PHRED_BINS
+        remainder = cat // NUM_PHRED_BINS
+        ob = remainder % NUM_BASES
+        tb = remainder // NUM_BASES
+        if tb == ob:
+            logits[:, cat] = float(pb)
+        else:
+            for s in range(num_states):
+                logits[s, cat] = -8.0 + s * 1.0
+    return logits
+
+
+init_logits = init_emission_logits(NUM_STATES)
+init_probs = torch.softmax(init_logits, dim=-1).numpy()
+
+# Summarise initial error rates
+match_mask = np.array([
+    decode_category(cat)[0] == decode_category(cat)[1]
+    for cat in range(NUM_OBS_CATEGORIES)
+])
+print("Initial emission error rates per state:")
+for s in range(NUM_STATES):
+    er = init_probs[s, ~match_mask].sum()
+    print(f"  State {s}: {er:.4%}")
+```
+
+```{python}
+# Visualise initial emission distributions (match vs error, by phred bin)
+fig, axes = plt.subplots(1, NUM_STATES, figsize=(5 * NUM_STATES, 4), sharey=True)
+
+phred_bin_vals = np.arange(NUM_PHRED_BINS)
+
+for s, ax in enumerate(axes):
+    match_by_phred = np.zeros(NUM_PHRED_BINS)
+    error_by_phred = np.zeros(NUM_PHRED_BINS)
+    for cat in range(NUM_OBS_CATEGORIES):
+        pb = cat % NUM_PHRED_BINS
+        tb, ob, _ = decode_category(cat)
+        if tb == ob:
+            match_by_phred[pb] += init_probs[s, cat]
+        else:
+            error_by_phred[pb] += init_probs[s, cat]
+
+    ax.bar(phred_bin_vals - 0.2, match_by_phred, width=0.4, label="match", color="steelblue")
+    ax.bar(phred_bin_vals + 0.2, error_by_phred, width=0.4, label="error", color="crimson")
+    ax.set_xticks(phred_bin_vals)
+    ax.set_xticklabels(PHRED_BIN_LABELS, rotation=45, ha="right", fontsize=8)
+    ax.set_title(f"State {s} — initial emissions")
+    ax.set_xlabel("Phred bin")
+    if s == 0:
+        ax.set_ylabel("Probability")
+    ax.legend(fontsize=8)
+
+plt.suptitle("Initial emission distribution (before training)", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+## 6. Model definition
+
+Discrete HMM with `pyro.param` parameters — equivalent to MAP Baum-Welch. The guide is empty (no latent samples); `Trace_ELBO` computes the log-likelihood directly via the forward algorithm.
+
+```{python}
+def hmm_model(
+    data: torch.Tensor,
+    lengths: torch.Tensor,
+    num_states: int,
+    max_length: int,
+) -> None:
+    """Pyro model: discrete HMM with Categorical emissions.
+
+    data:    [N, max_length] long tensor of encoded observations.
+    lengths: [N] actual sequence lengths (unused here — all seqs same length).
+    """
+    s = num_states
+    k = NUM_OBS_CATEGORIES
+
+    initial_logits = pyro.param("initial_logits", torch.zeros(s))
+    transition_logits = pyro.param("transition_logits", torch.eye(s) * 3.0)
+    emission_logits = pyro.param("emission_logits", init_emission_logits(s))
+
+    obs_dist = dist.Categorical(logits=emission_logits)
+
+    with pyro.plate("sequences", data.shape[0]):
+        hmm = dist.DiscreteHMM(
+            initial_logits=initial_logits,
+            transition_logits=transition_logits,
+            observation_dist=obs_dist,
+            duration=max_length,
+        )
+        pyro.sample("obs", hmm, obs=data)
+
+
+def hmm_guide(
+    data: torch.Tensor,
+    lengths: torch.Tensor,
+    num_states: int,
+    max_length: int,
+) -> None:
+    """Empty guide — all parameters are pyro.param; no latent samples."""
+
+
+print("Model defined.")
+```
+
+## 7. Pad sequences and train
+
+```{python}
+def pad_sequences(sequences: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad variable-length sequences to a single [N, max_len] tensor."""
+    lengths = torch.tensor([s.shape[0] for s in sequences], dtype=torch.long)
+    max_len = int(lengths.max().item())
+    padded = torch.zeros(len(sequences), max_len, dtype=torch.long)
+    for i, s in enumerate(sequences):
+        padded[i, : s.shape[0]] = s
+    return padded, lengths
+
+
+data, lengths = pad_sequences(all_sequences)
+max_length = int(lengths.max().item())
+
+print(f"Data tensor shape: {data.shape}")
+print(f"Sequence lengths — min={lengths.min()}, max={lengths.max()}, unique={lengths.unique().tolist()}")
+```
+
+```{python}
+# ── Training hyperparameters ──────────────────────────────────────────────────
+RUN_TRAINING = False
+OUTPUT_PATH = Path("hmm_error_model.pt")
+LR = 0.005
+NUM_STEPS = 1000
+LOG_EVERY = 50
+
+loss_history: list[float] = []
+
+if RUN_TRAINING or not OUTPUT_PATH.exists():
+    pyro.clear_param_store()
+
+    svi = SVI(
+        hmm_model,
+        hmm_guide,
+        pyro.optim.Adam({"lr": LR}),
+        loss=Trace_ELBO(),
+    )
+
+    for step in range(NUM_STEPS):
+        loss = svi.step(data, lengths, NUM_STATES, max_length)
+        loss_history.append(loss)
+        if step % LOG_EVERY == 0 or step == NUM_STEPS - 1:
+            logger.info("Step %4d / %d  loss = %.1f", step, NUM_STEPS, loss)
+
+    params = {name: val.detach().clone() for name, val in pyro.get_param_store().items()}
+    print(f"\nFinal loss: {loss_history[-1]:.1f}")
+else:
+    params = torch.load(OUTPUT_PATH, weights_only=True)
+    print(f"Loaded saved model parameters from {OUTPUT_PATH.resolve()}")
+    print("Set RUN_TRAINING = True to retrain instead of loading the saved model.")
+```
+
+```{python}
+# ── Training loss curve ───────────────────────────────────────────────────────
+if loss_history:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    steps = np.arange(len(loss_history))
+
+    axes[0].plot(steps, loss_history, color="steelblue", linewidth=0.8)
+    axes[0].set_xlabel("Step")
+    axes[0].set_ylabel("Negative ELBO (loss)")
+    axes[0].set_title("Training loss")
+
+    # Log-scale version to reveal fine convergence
+    axes[1].plot(steps, loss_history, color="steelblue", linewidth=0.8)
+    axes[1].set_yscale("log")
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Loss (log scale)")
+    axes[1].set_title("Training loss (log scale)")
+
+    plt.tight_layout()
+    plt.show()
+else:
+    print("Loaded saved model; no training loss history is available in hmm_error_model.pt.")
+```
+
+## 8. Inspect learned parameters
+
+```{python}
+# Extract and convert parameters to probabilities
+if RUN_TRAINING:
+    params = {name: val.detach().clone() for name, val in pyro.get_param_store().items()}
+
+initial   = torch.softmax(params["initial_logits"], dim=-1)
+transition = torch.softmax(params["transition_logits"], dim=-1)
+emission   = torch.softmax(params["emission_logits"], dim=-1)
+
+print("=== Initial state probabilities ===")
+for s in range(NUM_STATES):
+    print(f"  State {s}: {initial[s].item():.4f}")
+
+print("\n=== Transition matrix ===")
+trans_np = transition.numpy()
+trans_df = pd.DataFrame(
+    trans_np,
+    index=[f"From S{i}" for i in range(NUM_STATES)],
+    columns=[f"To S{j}" for j in range(NUM_STATES)],
+)
+print(trans_df.to_string(float_format="{:.4f}".format))
+```
+
+```{python}
+# ── Transition matrix heatmap ─────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(5, 4))
+sns.heatmap(
+    trans_df, annot=True, fmt=".3f", cmap="Blues", ax=ax,
+    vmin=0, vmax=1, linewidths=0.5,
+    cbar_kws={"label": "Transition probability"},
+)
+ax.set_title("HMM Transition Matrix")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Per-state emission distribution (match vs error, by phred bin) ─────────────
+emission_np = emission.numpy()
+
+fig, axes = plt.subplots(1, NUM_STATES, figsize=(5 * NUM_STATES, 4), sharey=True)
+
+for s, ax in enumerate(axes):
+    match_by_phred = np.zeros(NUM_PHRED_BINS)
+    error_by_phred = np.zeros(NUM_PHRED_BINS)
+    for cat in range(NUM_OBS_CATEGORIES):
+        pb = cat % NUM_PHRED_BINS
+        tb, ob, _ = decode_category(cat)
+        if tb == ob:
+            match_by_phred[pb] += emission_np[s, cat]
+        else:
+            error_by_phred[pb] += emission_np[s, cat]
+
+    x = np.arange(NUM_PHRED_BINS)
+    ax.bar(x - 0.2, match_by_phred, width=0.4, label="match", color="steelblue")
+    ax.bar(x + 0.2, error_by_phred * 1000, width=0.4, label="error ×1000", color="crimson", alpha=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(PHRED_BIN_LABELS, rotation=45, ha="right", fontsize=8)
+    ax.set_title(f"State {s}\np(initial)={initial[s].item():.3f}")
+    ax.set_xlabel("Phred bin")
+    if s == 0:
+        ax.set_ylabel("Probability")
+    ax.legend(fontsize=8)
+
+plt.suptitle("Learned emission distributions (error bars scaled ×1000 for visibility)", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# ── Per-state error rate ──────────────────────────────────────────────────────
+print("=== Per-state error rate ===")
+state_error_rates = []
+for s in range(NUM_STATES):
+    error_prob = sum(
+        emission_np[s, cat]
+        for cat in range(NUM_OBS_CATEGORIES)
+        if decode_category(cat)[0] != decode_category(cat)[1]
+    )
+    state_error_rates.append(error_prob)
+    self_trans = trans_np[s, s]
+    mean_run = 1 / (1 - self_trans) if self_trans < 1 else float("inf")
+    print(f"  State {s}: error_rate={error_prob:.6%}  "
+          f"p(self)={self_trans:.4f}  mean_run_length={mean_run:.1f} bases")
+```
+
+```{python}
+# ── Top emission categories per state ─────────────────────────────────────────
+TOP_K = 12
+
+for s in range(NUM_STATES):
+    probs = emission_np[s]
+    top_cats = np.argsort(probs)[::-1][:TOP_K]
+    print(f"\nState {s} — top {TOP_K} emission categories:")
+    print(f"  {'Event':<12} {'Phred bin':<10} {'Prob':>8}")
+    for cat in top_cats:
+        tb, ob, ql = decode_category(cat)
+        label = "match" if tb == ob else f"{tb}>{ob}"
+        print(f"  {label:<12} {ql:<10} {probs[cat]:8.5f}")
+```
+
+```{python}
+# ── Comparison: initial vs learned emissions ───────────────────────────────────
+fig, axes = plt.subplots(NUM_STATES, 2, figsize=(12, 3.5 * NUM_STATES))
+
+for s in range(NUM_STATES):
+    for col, (logits_src, title_suffix) in enumerate([
+        (init_emission_logits(NUM_STATES), "initial"),
+        (params["emission_logits"], "learned"),
+    ]):
+        probs = torch.softmax(logits_src, dim=-1).numpy()[s]
+        match_by_phred = np.zeros(NUM_PHRED_BINS)
+        error_by_phred = np.zeros(NUM_PHRED_BINS)
+        for cat in range(NUM_OBS_CATEGORIES):
+            pb = cat % NUM_PHRED_BINS
+            tb, ob, _ = decode_category(cat)
+            if tb == ob:
+                match_by_phred[pb] += probs[cat]
+            else:
+                error_by_phred[pb] += probs[cat]
+
+        ax = axes[s, col]
+        x = np.arange(NUM_PHRED_BINS)
+        ax.bar(x - 0.2, match_by_phred, width=0.4, label="match", color="steelblue")
+        ax.bar(x + 0.2, error_by_phred * 1000, width=0.4, label="error ×1000",
+               color="crimson", alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(PHRED_BIN_LABELS, rotation=45, ha="right", fontsize=8)
+        ax.set_title(f"State {s} — {title_suffix}")
+        ax.set_xlabel("Phred bin")
+        ax.set_ylabel("Probability")
+        ax.legend(fontsize=8)
+
+plt.suptitle("Emission distributions: initial vs learned", fontsize=13, y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+## 9. Save model
+
+```{python}
+torch.save(params, OUTPUT_PATH)
+print(f"Saved model parameters to {OUTPUT_PATH.resolve()}")
+print(f"Saved keys: {list(params.keys())}")
+```
+
+## 10. Load and inspect a saved model
+
+```{python}
+# Run this cell independently to reload a saved model without retraining
+loaded_params = torch.load(OUTPUT_PATH, weights_only=True)
+
+loaded_initial    = torch.softmax(loaded_params["initial_logits"], dim=-1)
+loaded_transition = torch.softmax(loaded_params["transition_logits"], dim=-1)
+loaded_emission   = torch.softmax(loaded_params["emission_logits"], dim=-1)
+
+num_states_loaded = loaded_initial.shape[0]
+print(f"Loaded model: {num_states_loaded} states")
+print("Initial probs:", loaded_initial.numpy().round(4))
+print("Transition matrix:")
+print(loaded_transition.numpy().round(4))
+
+print("\nPer-state error rates:")
+for s in range(num_states_loaded):
+    er = sum(
+        loaded_emission[s, cat].item()
+        for cat in range(NUM_OBS_CATEGORIES)
+        if decode_category(cat)[0] != decode_category(cat)[1]
+    )
+    print(f"  State {s}: {er:.6%}")
+```
+
+
+# `skiver` outputs
+
+```{python}
+RUN_DIR = Path("../../skiver_run/mimicc_example")
+SAMPLE  = "250700000051_25Nov5669-DL133_S133_L001"
+```
+
+## 1. Summary read position
+
+```{python}
+data = pd.read_csv(RUN_DIR / f'{SAMPLE}_R2.summary_read_position.csv')
+data.shape
+```
+
+```{python}
+sns.scatterplot(data=data[data.from_start==True], x='index', y='error_rate')
+```
+
+```{python}
+sns.scatterplot(data=data[data.from_start==False], x='index', y='error_rate')
+```
+
+```{python}
+bins = np.linspace(0, 310, 6)
+bin_w = bins[1]-bins[0]
+binned_data = defaultdict(list)
+for idx,r in data[data.from_start==True].iterrows():
+    k = r['index']//bin_w
+    binned_data[k].append(r['error_rate'])
+binned_data = pd.DataFrame({k:{'bin': int(k*bin_w), 'mean_error_rate': np.mean(vs)} for k,vs in binned_data.items()}).T
+sns.barplot(data=binned_data, x='bin', y='mean_error_rate')
+```
+
+```{python}
+bins = np.linspace(0, 310, 6)
+bin_w = bins[1]-bins[0]
+binned_data = defaultdict(list)
+for idx,r in data[data.from_start==False].iterrows():
+    k = r['index']//bin_w
+    binned_data[k].append(r['error_rate'])
+binned_data = pd.DataFrame({k:{'bin': int(k*bin_w), 'mean_error_rate': np.mean(vs)} for k,vs in binned_data.items()}).T
+sns.barplot(data=binned_data, x='bin', y='mean_error_rate')
+```
