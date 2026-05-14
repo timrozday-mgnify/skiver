@@ -1,0 +1,1072 @@
+## Setup
+
+```{python}
+from __future__ import annotations
+
+import os
+import math
+import gzip
+from collections import Counter, defaultdict
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/skiver-mpl-cache")
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from IPython.display import display
+
+sns.set_theme(style="whitegrid", palette="muted")
+plt.rcParams["figure.dpi"] = 120
+
+RESULT_DIR = Path(RESULT_DIR)
+PASSES_FILTER_ONLY = True
+BASE_CHUNKSIZE = 1_000_000
+MAX_AUTOCORR_LAG = 6
+FASTQ_SAMPLE_READS = 1_000
+QUALITY_MAX_BASES_PER_READ = 2_000
+MAX_QUALITY_AUTOCORR_LAG = 200
+QUALITY_AUTOCORR_DECAY_WINDOW = 10
+
+SUMMARY_SUFFIXES = {
+    "error_rate": ".summary_error_rate.csv",
+    "hazard": ".hazard_rate.csv",
+    "phred": ".summary_phred.csv",
+    "spectrum": ".summary_error_spectrum.csv",
+    "spectrum_t": ".summary_error_spectrum_dependence_on_t.csv",
+    "read_position": ".summary_read_position.csv",
+    "kvmer": ".kvmer.csv",
+    "base": ".base_observations.tsv",
+}
+
+
+def discover_prefixes(result_dir: Path) -> list[Path]:
+    files = sorted(result_dir.glob(f"*{SUMMARY_SUFFIXES['error_rate']}"))
+    return [Path(str(path).removesuffix(SUMMARY_SUFFIXES["error_rate"])) for path in files]
+
+
+PREFIXES = discover_prefixes(RESULT_DIR)
+if not PREFIXES:
+    raise FileNotFoundError(f"No Skiver summary_error_rate.csv files found in {RESULT_DIR}")
+
+print(f"Sample: {SAMPLE_NAME}")
+print(f"Split: {SPLIT_NAME}")
+print(f"Result directory: {RESULT_DIR.resolve()}")
+print("Prefixes:")
+for prefix in PREFIXES:
+    print(f"  - {prefix.name}")
+```
+
+```{python}
+def path_for(prefix: Path, kind: str) -> Path:
+    return Path(f"{prefix}{SUMMARY_SUFFIXES[kind]}")
+
+
+def read_csv(prefix: Path, kind: str) -> pd.DataFrame:
+    path = path_for(prefix, kind)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return pd.read_csv(path)
+
+
+def classify_op(op: str) -> str:
+    if op.startswith("->"):
+        return "Insertion"
+    if op.endswith(">-"):
+        return "Deletion"
+    if ">" in op:
+        return "Substitution"
+    return "Other"
+
+
+def fmt_pct(x: float) -> str:
+    return f"{x:.4%}"
+
+
+def parse_interval(value: object) -> tuple[float, float] | tuple[None, None]:
+    if not isinstance(value, str) or "~" not in value:
+        return None, None
+    lo, hi = value.split("~", 1)
+    return float(lo), float(hi)
+
+
+file_rows = []
+for prefix in PREFIXES:
+    for kind in SUMMARY_SUFFIXES:
+        path = path_for(prefix, kind)
+        file_rows.append({
+            "prefix": prefix.name,
+            "file": path.name,
+            "kind": kind,
+            "exists": path.exists(),
+            "size_mb": path.stat().st_size / 1_000_000 if path.exists() else np.nan,
+        })
+
+file_df = pd.DataFrame(file_rows)
+display(file_df)
+```
+
+## Scalar Error Summary
+
+This section uses `*.summary_error_rate.csv`, one row per Skiver prefix. It reports the fitted per-base error rate, the effective error rate after the survival-model correction, Weibull parameters, and typical coverage. These values are the highest-level summary of whether a sample/split behaves like a low-error or high-error sequencing run.
+
+```{python}
+summary_rows = []
+for prefix in PREFIXES:
+    df = read_csv(prefix, "error_rate")
+    row = df.iloc[0].to_dict()
+    row["prefix"] = prefix.name
+    summary_rows.append(row)
+
+summary_df = pd.DataFrame(summary_rows)
+cols = [
+    "prefix",
+    "per_base_error_rate",
+    "effective_error_rate",
+    "lambda",
+    "beta",
+    "key_median_coverage",
+    "true_median_coverage",
+]
+display(summary_df[cols])
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+x = np.arange(len(summary_df))
+labels = summary_df["prefix"].str.replace("_", "\n", regex=False)
+
+axes[0].bar(x - 0.18, summary_df["per_base_error_rate"] * 100, width=0.36, label="per-base")
+axes[0].bar(x + 0.18, summary_df["effective_error_rate"] * 100, width=0.36, label="effective")
+axes[0].set_xticks(x)
+axes[0].set_xticklabels(labels, rotation=0, fontsize=8)
+axes[0].set_ylabel("Error rate (%)")
+axes[0].set_title("Skiver error-rate estimates")
+axes[0].legend()
+
+axes[1].bar(x, summary_df["beta"], color="slategray")
+axes[1].axhline(1.0, color="black", linestyle="--", linewidth=1)
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(labels, rotation=0, fontsize=8)
+axes[1].set_ylabel("beta")
+axes[1].set_title("Weibull beta")
+
+plt.tight_layout()
+plt.show()
+```
+
+## Hazard And Survival
+
+This section uses `*.hazard_rate.csv`. The hazard ratio is the observed probability that the first disagreement with the consensus appears at value-window position `t`, conditional on no earlier disagreement. The survival curve is the cumulative probability of remaining error-free across the reported value window, so strong position effects show up as sharp drops.
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+for prefix in PREFIXES:
+    hazard = read_csv(prefix, "hazard")
+    axes[0].plot(hazard["t"], hazard["hazard_ratio"], marker="o", linewidth=1.8, label=prefix.name)
+    if {"5th_percentile", "95th_percentile"}.issubset(hazard.columns):
+        axes[0].fill_between(
+            hazard["t"],
+            hazard["5th_percentile"],
+            hazard["95th_percentile"],
+            alpha=0.15,
+        )
+
+    survival = (1.0 - hazard["hazard_ratio"]).cumprod()
+    axes[1].plot(hazard["t"], survival, marker="o", linewidth=1.8, label=prefix.name)
+
+axes[0].set_xlabel("t")
+axes[0].set_ylabel("Hazard ratio")
+axes[0].set_title("Observed hazard ratio")
+axes[0].legend(fontsize=7)
+
+axes[1].set_xlabel("t")
+axes[1].set_ylabel("Empirical survival")
+axes[1].set_title("Cumulative survival over reported window")
+axes[1].legend(fontsize=7)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Base Observations
+
+This section streams `*.base_observations.tsv`, which contains one row per value-window base aligned against the inferred consensus. It is the most direct observation-level view of errors: the position plot shows where errors occur inside the value window, the sequence-length plot checks the emitted alignment lengths, and the matrix shows which consensus bases are observed as which alternatives.
+
+```{python}
+BASES5 = ["A", "C", "G", "T", "-"]
+REPEAT_CONTEXTS = [str(i) for i in range(1, 11)]
+HOMOPOLYMER_ERROR_CLASSES = ["Insertion", "Deletion", "Substitution"]
+
+
+def repeat_context_label(length: int) -> str | None:
+    length = max(length, 1)
+    if length <= 10:
+        return str(length)
+    return None
+
+
+def homopolymer_context_dataframe(state: dict) -> pd.DataFrame:
+    rows = []
+    for context in REPEAT_CONTEXTS:
+        opportunities = state["opportunities"][context]
+        row = {
+            "repeat_context": context,
+            "opportunities": opportunities,
+        }
+        total_errors = 0
+        for error_class in HOMOPOLYMER_ERROR_CLASSES:
+            count = state["errors"][context][error_class]
+            total_errors += count
+            row[f"{error_class.lower()}_count"] = count
+            row[f"{error_class.lower()}_rate"] = count / opportunities if opportunities else np.nan
+        row["all_error_count"] = total_errors
+        row["all_error_rate"] = total_errors / opportunities if opportunities else np.nan
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def finalize_homopolymer_sequence(rows: list[tuple[str, str, str]], state: dict) -> None:
+    if not rows:
+        return
+
+    run_base = None
+    run_length = 0
+
+    for true_base, obs_base, prev_base in rows:
+        if true_base != "-":
+            if run_base is None:
+                run_base = true_base
+                run_length = 2 if prev_base == true_base else 1
+            elif true_base == run_base:
+                run_length += 1
+            else:
+                run_base = true_base
+                run_length = 1
+
+            context = repeat_context_label(run_length)
+            if context is not None:
+                state["opportunities"][context] += 1
+                if obs_base == "-":
+                    state["errors"][context]["Deletion"] += 1
+                elif obs_base != true_base:
+                    state["errors"][context]["Substitution"] += 1
+            continue
+
+        if obs_base == "-":
+            continue
+        if run_base is None:
+            insertion_run_length = 2 if obs_base == prev_base else 1
+        else:
+            insertion_run_length = run_length + 1 if obs_base == run_base else 1
+        context = repeat_context_label(insertion_run_length)
+        if context is not None:
+            state["errors"][context]["Insertion"] += 1
+
+
+def update_homopolymer_sequences(groups: pd.DataFrame, state: dict) -> None:
+    if groups.empty:
+        return
+
+    items = [
+        (obs_id, list(zip(row["true_base"], row["obs_base"], row["prev_base"])))
+        for obs_id, row in groups.iterrows()
+    ]
+    if state["obs_id"] is not None:
+        first_id, first_rows = items[0]
+        if first_id == state["obs_id"]:
+            state["rows"].extend(first_rows)
+            items = items[1:]
+        else:
+            finalize_homopolymer_sequence(state["rows"], state)
+            state["obs_id"] = None
+            state["rows"] = []
+
+    if not items:
+        return
+
+    for obs_id, rows in items[:-1]:
+        finalize_homopolymer_sequence(rows, state)
+
+    state["obs_id"], state["rows"] = items[-1]
+
+
+def finalize_error_sequence(errors: list[bool], state: dict) -> None:
+    if not errors:
+        return
+
+    num_errors = int(np.sum(errors))
+    state["error_count_dist"][min(num_errors, 3)] += 1
+
+    arr = np.asarray(errors, dtype=bool)
+    n = len(arr)
+    for lag in range(1, MAX_AUTOCORR_LAG + 1):
+        if n <= lag:
+            continue
+
+        left = arr[:-lag]
+        right = arr[lag:]
+        pair_count = len(left)
+        left_errors = int(left.sum())
+        right_errors = int(right.sum())
+        both_errors = int((left & right).sum())
+
+        state["lag_pairs"][lag] += pair_count
+        state["lag_left_errors"][lag] += left_errors
+        state["lag_right_errors"][lag] += right_errors
+        state["lag_both_errors"][lag] += both_errors
+
+
+def update_error_sequences(groups: pd.Series, state: dict) -> None:
+    if groups.empty:
+        return
+
+    items = list(groups.items())
+    if state["obs_id"] is not None:
+        first_id, first_errors = items[0]
+        if first_id == state["obs_id"]:
+            state["errors"].extend(bool(x) for x in first_errors)
+            items = items[1:]
+        else:
+            finalize_error_sequence(state["errors"], state)
+            state["obs_id"] = None
+            state["errors"] = []
+
+    if not items:
+        return
+
+    for obs_id, errors in items[:-1]:
+        finalize_error_sequence([bool(x) for x in errors], state)
+
+    state["obs_id"], state["errors"] = items[-1][0], [bool(x) for x in items[-1][1]]
+
+
+def autocorr_dataframe(state: dict) -> pd.DataFrame:
+    rows = []
+    for lag in range(1, MAX_AUTOCORR_LAG + 1):
+        pairs = state["lag_pairs"][lag]
+        left = state["lag_left_errors"][lag]
+        right = state["lag_right_errors"][lag]
+        both = state["lag_both_errors"][lag]
+
+        if pairs == 0:
+            rows.append({
+                "lag": lag,
+                "pairs": 0,
+                "both_errors": 0,
+                "joint_error_rate": np.nan,
+                "expected_joint_error_rate": np.nan,
+                "enrichment": np.nan,
+                "phi": np.nan,
+            })
+            continue
+
+        p_left = left / pairs
+        p_right = right / pairs
+        observed = both / pairs
+        expected = p_left * p_right
+        n11 = both
+        n10 = left - both
+        n01 = right - both
+        n00 = pairs - n11 - n10 - n01
+        denom = math.sqrt(float((n11 + n10) * (n01 + n00) * (n11 + n01) * (n10 + n00)))
+        phi = (n11 * n00 - n10 * n01) / denom if denom else np.nan
+
+        rows.append({
+            "lag": lag,
+            "pairs": pairs,
+            "both_errors": both,
+            "joint_error_rate": observed,
+            "expected_joint_error_rate": expected,
+            "enrichment": observed / expected if expected else np.nan,
+            "phi": phi,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def update_sequence_lengths(groups: pd.Series, state: dict, counter: Counter) -> None:
+    if groups.empty:
+        return
+
+    items = list(groups.items())
+    if state["obs_id"] is not None:
+        first_id, first_count = items[0]
+        if first_id == state["obs_id"]:
+            state["count"] += int(first_count)
+            items = items[1:]
+        else:
+            counter[state["count"]] += 1
+            state["obs_id"] = None
+            state["count"] = 0
+
+    if not items:
+        return
+
+    for obs_id, count in items[:-1]:
+        counter[int(count)] += 1
+
+    state["obs_id"], state["count"] = items[-1][0], int(items[-1][1])
+
+
+def aggregate_base_observations(prefix: Path, passes_filter_only: bool = True) -> dict:
+    path = path_for(prefix, "base")
+    if not path.exists():
+        return {"prefix": prefix.name, "available": False}
+
+    usecols = ["obs_id", "t", "true_base", "obs_base", "prev_base", "phred", "passes_filter"]
+    t_counts = defaultdict(int)
+    t_errors = defaultdict(int)
+    subst = pd.DataFrame(0, index=BASES5, columns=BASES5, dtype=np.int64)
+    seq_lengths = Counter()
+    length_state = {"obs_id": None, "count": 0}
+    autocorr_state = {
+        "obs_id": None,
+        "errors": [],
+        "error_count_dist": Counter(),
+        "lag_pairs": defaultdict(int),
+        "lag_left_errors": defaultdict(int),
+        "lag_right_errors": defaultdict(int),
+        "lag_both_errors": defaultdict(int),
+    }
+    homopolymer_state = {
+        "obs_id": None,
+        "rows": [],
+        "opportunities": defaultdict(int),
+        "errors": defaultdict(lambda: defaultdict(int)),
+    }
+    total = 0
+    errors = 0
+
+    chunks = pd.read_csv(path, sep="\t", usecols=usecols, chunksize=BASE_CHUNKSIZE)
+    for chunk in chunks:
+        if passes_filter_only:
+            chunk = chunk[chunk["passes_filter"] == True]
+        if chunk.empty:
+            continue
+
+        is_error = chunk["true_base"] != chunk["obs_base"]
+        total += len(chunk)
+        errors += int(is_error.sum())
+
+        by_t_total = chunk.groupby("t", sort=True).size()
+        by_t_error = chunk.loc[is_error].groupby("t", sort=True).size()
+        for t, count in by_t_total.items():
+            t_counts[int(t)] += int(count)
+        for t, count in by_t_error.items():
+            t_errors[int(t)] += int(count)
+
+        matrix_chunk = pd.crosstab(
+            chunk.loc[is_error, "true_base"],
+            chunk.loc[is_error, "obs_base"],
+        ).reindex(index=BASES5, columns=BASES5, fill_value=0)
+        subst += matrix_chunk
+
+        obs_groups = chunk.groupby("obs_id", sort=False).size()
+        update_sequence_lengths(obs_groups, length_state, seq_lengths)
+
+        error_groups = is_error.groupby(chunk["obs_id"], sort=False).agg(list)
+        update_error_sequences(error_groups, autocorr_state)
+
+        homopolymer_groups = chunk.groupby("obs_id", sort=False)[["true_base", "obs_base", "prev_base"]].agg(list)
+        update_homopolymer_sequences(homopolymer_groups, homopolymer_state)
+
+    if length_state["obs_id"] is not None:
+        seq_lengths[length_state["count"]] += 1
+    if autocorr_state["obs_id"] is not None:
+        finalize_error_sequence(autocorr_state["errors"], autocorr_state)
+    if homopolymer_state["obs_id"] is not None:
+        finalize_homopolymer_sequence(homopolymer_state["rows"], homopolymer_state)
+
+    pos_df = pd.DataFrame({
+        "t": sorted(t_counts),
+        "total": [t_counts[t] for t in sorted(t_counts)],
+        "errors": [t_errors[t] for t in sorted(t_counts)],
+    })
+    pos_df["error_rate"] = pos_df["errors"] / pos_df["total"]
+
+    return {
+        "prefix": prefix.name,
+        "available": True,
+        "total": total,
+        "errors": errors,
+        "error_rate": errors / total if total else np.nan,
+        "pos": pos_df,
+        "subst": subst,
+        "seq_lengths": seq_lengths,
+        "error_count_dist": autocorr_state["error_count_dist"],
+        "autocorr": autocorr_dataframe(autocorr_state),
+        "homopolymer": homopolymer_context_dataframe(homopolymer_state),
+    }
+
+
+base_summaries = [
+    aggregate_base_observations(prefix, passes_filter_only=PASSES_FILTER_ONLY)
+    for prefix in PREFIXES
+]
+
+base_summary_df = pd.DataFrame([
+    {
+        "prefix": s["prefix"],
+        "available": s["available"],
+        "base_observations": s.get("total", 0),
+        "errors": s.get("errors", 0),
+        "observed_error_rate": s.get("error_rate", np.nan),
+    }
+    for s in base_summaries
+])
+display(base_summary_df)
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+for summary in base_summaries:
+    if not summary["available"]:
+        continue
+    pos = summary["pos"]
+    axes[0].plot(pos["t"], pos["error_rate"] * 100, marker="o", linewidth=1.8, label=summary["prefix"])
+
+    lengths = pd.DataFrame(
+        {"length": list(summary["seq_lengths"].keys()), "count": list(summary["seq_lengths"].values())}
+    ).sort_values("length")
+    axes[1].bar(
+        lengths["length"].astype(str),
+        lengths["count"],
+        alpha=0.65,
+        label=summary["prefix"],
+    )
+
+axes[0].set_xlabel("Position in value window (t)")
+axes[0].set_ylabel("Observed error rate (%)")
+axes[0].set_title("Error rate by value-window position")
+axes[0].yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f%%"))
+axes[0].legend(fontsize=7)
+
+axes[1].set_xlabel("Value-window sequence length")
+axes[1].set_ylabel("Observation count")
+axes[1].set_title("Sequence length distribution")
+axes[1].legend(fontsize=7)
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+for summary in base_summaries:
+    if not summary["available"]:
+        continue
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        summary["subst"],
+        annot=True,
+        fmt="d",
+        cmap="Reds",
+        linewidths=0.5,
+        cbar_kws={"label": "count"},
+        ax=ax,
+    )
+    ax.set_xlabel("Observed base")
+    ax.set_ylabel("Consensus base")
+    ax.set_title(f"Observed error matrix: {summary['prefix']}")
+    plt.tight_layout()
+    plt.show()
+```
+
+## Error Autocorrelation
+
+This section also uses `*.base_observations.tsv`. Each `obs_id` is converted to a binary sequence over value-window positions, where `1` means the observed base differs from the consensus. The lag analysis asks whether an error at one position makes another error nearby more common than expected from the marginal error rates; enrichment above `1` or positive phi correlation suggests clustering, which can be consistent with latent read-level or sequence-context factors.
+
+```{python}
+autocorr_tables = []
+for summary in base_summaries:
+    if not summary["available"]:
+        continue
+    autocorr = summary["autocorr"].copy()
+    autocorr.insert(0, "prefix", summary["prefix"])
+    autocorr_tables.append(autocorr)
+
+if autocorr_tables:
+    autocorr_df = pd.concat(autocorr_tables, ignore_index=True)
+    display(autocorr_df)
+else:
+    autocorr_df = pd.DataFrame()
+    print("No base observations available for autocorrelation analysis.")
+```
+
+```{python}
+if not autocorr_df.empty:
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    for prefix, sub in autocorr_df.groupby("prefix"):
+        axes[0].plot(sub["lag"], sub["enrichment"], marker="o", linewidth=1.8, label=prefix)
+        axes[1].plot(sub["lag"], sub["phi"], marker="o", linewidth=1.8, label=prefix)
+
+    axes[0].axhline(1.0, color="black", linestyle="--", linewidth=1)
+    axes[0].set_xlabel("Lag between value-window positions")
+    axes[0].set_ylabel("Observed / expected joint error rate")
+    axes[0].set_title("Lagged error enrichment")
+    axes[0].legend(fontsize=7)
+
+    axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1)
+    axes[1].set_xlabel("Lag between value-window positions")
+    axes[1].set_ylabel("Phi correlation")
+    axes[1].set_title("Lagged binary error correlation")
+    axes[1].legend(fontsize=7)
+
+    plt.tight_layout()
+    plt.show()
+```
+
+```{python}
+for summary in base_summaries:
+    if not summary["available"]:
+        continue
+
+    dist = summary["error_count_dist"]
+    dist_df = pd.DataFrame({
+        "errors_per_sequence": ["0", "1", "2", ">=3"],
+        "count": [dist.get(0, 0), dist.get(1, 0), dist.get(2, 0), dist.get(3, 0)],
+    })
+    display(pd.DataFrame({"prefix": [summary["prefix"]]}))
+    display(dist_df)
+
+    fig, ax = plt.subplots(figsize=(5.5, 3.5))
+    ax.bar(dist_df["errors_per_sequence"], dist_df["count"], color="slategray", alpha=0.8)
+    ax.set_xlabel("Errors per value-window observation")
+    ax.set_ylabel("Observation count")
+    ax.set_title(f"{summary['prefix']}: within-sequence error counts")
+    plt.tight_layout()
+    plt.show()
+```
+
+## Phred Calibration
+
+This section uses `*.summary_phred.csv`. It compares the empirical error rate observed at each Phred score against the nominal probability implied by the Phred scale. Agreement with the dashed curve suggests well-calibrated base qualities; systematic offsets indicate over- or under-confident quality scores.
+
+```{python}
+fig, axes = plt.subplots(1, len(PREFIXES), figsize=(6 * len(PREFIXES), 4), squeeze=False)
+
+for ax, prefix in zip(axes.ravel(), PREFIXES):
+    phred = read_csv(prefix, "phred").copy()
+    phred["num_total"] = phred["num_correct"] + phred["num_error"]
+    phred = phred[phred["num_total"] > 0]
+
+    if not phred.empty:
+        q_theory = np.linspace(max(1, phred["qscore"].min()), phred["qscore"].max(), 300)
+        ax.plot(q_theory, 10 ** (-q_theory / 10.0), color="black", linestyle="--", label="theoretical")
+        ax.plot(phred["qscore"], phred["error_rate"], marker="o", linewidth=2, label="empirical")
+        ax.set_yscale("log")
+    ax.set_xlabel("Phred score")
+    ax.set_ylabel("Error rate")
+    ax.set_title(prefix.name)
+    ax.legend(fontsize=7)
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+fig, axes = plt.subplots(1, len(PREFIXES), figsize=(6 * len(PREFIXES), 3.5), squeeze=False)
+
+for ax, prefix in zip(axes.ravel(), PREFIXES):
+    phred = read_csv(prefix, "phred").copy()
+    phred["num_total"] = phred["num_correct"] + phred["num_error"]
+    ax.bar(phred["qscore"], phred["num_total"], color="slategray", alpha=0.75)
+    ax.set_xlabel("Phred score")
+    ax.set_ylabel("Bases used")
+    ax.set_title(prefix.name)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Quality Score Autocorrelation
+
+This section samples quality strings directly from the FASTQ files in the result directory. For each sampled read, Phred scores are compared with scores at increasing within-read lags. Positive autocorrelation at long lags means quality tends to stay high or low over extended stretches of a read; the decay columns report the first lag where absolute autocorrelation remains below a threshold for several consecutive lags.
+
+```{python}
+def discover_fastq_files(result_dir: Path) -> list[Path]:
+    patterns = ["*.fastq", "*.fastq.gz", "*.fq", "*.fq.gz"]
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(result_dir.glob(pattern))
+
+    chosen = {}
+    for path in sorted(candidates):
+        key = path.name.removesuffix(".gz")
+        if key not in chosen or path.suffix == ".gz":
+            chosen[key] = path
+    return list(chosen.values())
+
+
+def open_fastq(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt")
+    return path.open("rt")
+
+
+def iter_fastq_qualities(path: Path, max_reads: int):
+    with open_fastq(path) as handle:
+        for i, line in enumerate(handle):
+            if i % 4 == 3:
+                qualities = line.rstrip()[:QUALITY_MAX_BASES_PER_READ]
+                yield np.fromiter((ord(ch) - 33 for ch in qualities), dtype=np.float64)
+                if i // 4 + 1 >= max_reads:
+                    break
+
+
+def first_sustained_decay_lag(df: pd.DataFrame, threshold: float) -> int | float:
+    values = df["autocorrelation"].abs().to_numpy()
+    lags = df["lag"].to_numpy()
+    for idx in range(0, len(values) - QUALITY_AUTOCORR_DECAY_WINDOW + 1):
+        window = values[idx:idx + QUALITY_AUTOCORR_DECAY_WINDOW]
+        if np.all(np.isfinite(window)) and np.all(window < threshold):
+            return int(lags[idx])
+    return np.nan
+
+
+def quality_autocorrelation(path: Path, max_reads: int = FASTQ_SAMPLE_READS) -> dict:
+    stats = {
+        lag: {"n": 0, "sum_x": 0.0, "sum_y": 0.0, "sum_x2": 0.0, "sum_y2": 0.0, "sum_xy": 0.0}
+        for lag in range(1, MAX_QUALITY_AUTOCORR_LAG + 1)
+    }
+    read_lengths = []
+
+    for qualities in iter_fastq_qualities(path, max_reads):
+        read_lengths.append(len(qualities))
+        max_lag = min(MAX_QUALITY_AUTOCORR_LAG, len(qualities) - 1)
+        for lag in range(1, max_lag + 1):
+            x = qualities[:-lag]
+            y = qualities[lag:]
+            state = stats[lag]
+            state["n"] += len(x)
+            state["sum_x"] += float(x.sum())
+            state["sum_y"] += float(y.sum())
+            state["sum_x2"] += float(np.square(x).sum())
+            state["sum_y2"] += float(np.square(y).sum())
+            state["sum_xy"] += float(np.dot(x, y))
+
+    rows = []
+    for lag, state in stats.items():
+        n = state["n"]
+        if n == 0:
+            corr = np.nan
+        else:
+            cov = state["sum_xy"] - state["sum_x"] * state["sum_y"] / n
+            var_x = state["sum_x2"] - state["sum_x"] ** 2 / n
+            var_y = state["sum_y2"] - state["sum_y"] ** 2 / n
+            denom = math.sqrt(max(var_x * var_y, 0.0))
+            corr = cov / denom if denom else np.nan
+        rows.append({"lag": lag, "pairs": n, "autocorrelation": corr})
+
+    autocorr = pd.DataFrame(rows)
+    return {
+        "file": path.name,
+        "reads_sampled": len(read_lengths),
+        "median_read_length": float(np.median(read_lengths)) if read_lengths else np.nan,
+        "mean_read_length": float(np.mean(read_lengths)) if read_lengths else np.nan,
+        "autocorr": autocorr,
+        "decay_below_abs_0_10": first_sustained_decay_lag(autocorr, 0.10),
+        "decay_below_abs_0_05": first_sustained_decay_lag(autocorr, 0.05),
+    }
+
+
+fastq_files = discover_fastq_files(RESULT_DIR)
+quality_summaries = [quality_autocorrelation(path) for path in fastq_files]
+
+quality_summary_rows = []
+for summary in quality_summaries:
+    autocorr = summary["autocorr"].set_index("lag")
+    row = {
+        "file": summary["file"],
+        "reads_sampled": summary["reads_sampled"],
+        "median_read_length": summary["median_read_length"],
+        "mean_read_length": summary["mean_read_length"],
+        "decay_below_abs_0_10": summary["decay_below_abs_0_10"],
+        "decay_below_abs_0_05": summary["decay_below_abs_0_05"],
+    }
+    for lag in [1, 5, 10, 25, 50, 100, 200]:
+        row[f"autocorr_lag_{lag}"] = autocorr.loc[lag, "autocorrelation"] if lag in autocorr.index else np.nan
+    quality_summary_rows.append(row)
+
+if quality_summary_rows:
+    quality_summary_df = pd.DataFrame(quality_summary_rows)
+    display(quality_summary_df)
+else:
+    quality_summary_df = pd.DataFrame()
+    print(f"No FASTQ files found in {RESULT_DIR}")
+```
+
+```{python}
+if quality_summaries:
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    for summary in quality_summaries:
+        autocorr = summary["autocorr"]
+        ax.plot(
+            autocorr["lag"],
+            autocorr["autocorrelation"],
+            linewidth=1.6,
+            label=summary["file"],
+        )
+
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.axhline(0.10, color="gray", linestyle=":", linewidth=1)
+    ax.axhline(-0.10, color="gray", linestyle=":", linewidth=1)
+    ax.set_xlabel("Lag between quality scores within a read")
+    ax.set_ylabel("Pearson autocorrelation")
+    ax.set_title(f"Quality-score autocorrelation from first {FASTQ_SAMPLE_READS:,} reads")
+    ax.legend(fontsize=7)
+    plt.tight_layout()
+    plt.show()
+```
+
+## Read Position
+
+This section uses `*.summary_read_position.csv`. Skiver reports error rates by distance from the start and from the end of each read. These plots help identify end-of-read degradation, adapter/trimming artifacts, or platform-specific quality decay that is not visible from value-window position alone.
+
+```{python}
+def plot_read_position(prefix: Path, num_bases: int = 100) -> None:
+    df = read_csv(prefix, "read_position").copy()
+    df["num_total"] = df["num_correct"] + df["num_error"]
+    df_start = df[df["from_start"] == True].sort_values("index")
+    df_end = df[df["from_start"] == False].sort_values("index")
+    df_start = df_start[df_start["index"] <= num_bases]
+    df_end = df_end[df_end["index"] <= num_bases]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 7), gridspec_kw={"height_ratios": [3, 1]})
+    max_y = max(df_start["error_rate"].max(), df_end["error_rate"].max()) * 1.1
+
+    for col, (sub, label) in enumerate([(df_start, "from start"), (df_end, "from end")]):
+        ax_line = axes[0, col]
+        ax_bar = axes[1, col]
+        ax_line.plot(sub["index"], sub["error_rate"], color="slategray", linewidth=1.5)
+        ax_line.set_title(f"{prefix.name}: error rate {label}")
+        ax_line.set_ylabel("Error rate")
+        ax_line.set_ylim(0, max_y if np.isfinite(max_y) and max_y > 0 else 1)
+
+        ax_bar.bar(sub["index"], sub["num_total"], width=1.0, color="slategray", alpha=0.75)
+        ax_bar.set_xlabel("Read position")
+        ax_bar.set_ylabel("Bases")
+
+    plt.tight_layout()
+    plt.show()
+
+
+for prefix in PREFIXES:
+    plot_read_position(prefix)
+```
+
+## Error Spectrum
+
+This section uses `*.summary_error_spectrum.csv`. It shows which substitutions and indels dominate the inferred errors, scaled by the fitted Skiver error rate. The spectrum is useful for distinguishing platform-specific modes, such as substitution-heavy Illumina errors versus indel-heavy long-read errors.
+
+```{python}
+def build_spectrum_matrix(df: pd.DataFrame, count_col: str = "total") -> pd.DataFrame:
+    matrix = pd.DataFrame(0.0, index=BASES5, columns=BASES5)
+    for _, row in df.iterrows():
+        from_base, to_base = row["operation"].split(">")
+        from_base = from_base if from_base in BASES5 else "-"
+        to_base = to_base if to_base in BASES5 else "-"
+        matrix.loc[from_base, to_base] += row[count_col]
+    return matrix
+
+
+def error_type_counts(df: pd.DataFrame, count_col: str = "total") -> pd.Series:
+    typed = df.copy()
+    typed["type"] = typed["operation"].apply(classify_op)
+    return typed.groupby("type")[count_col].sum().reindex(["Insertion", "Deletion", "Substitution"], fill_value=0)
+
+
+for prefix in PREFIXES:
+    spectrum = read_csv(prefix, "spectrum")
+    rate = read_csv(prefix, "error_rate")["per_base_error_rate"].iloc[0]
+    matrix = build_spectrum_matrix(spectrum, "total")
+    if matrix.values.sum() > 0:
+        matrix_rate = matrix / matrix.values.sum() * rate * 100
+    else:
+        matrix_rate = matrix
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    sns.heatmap(
+        matrix_rate,
+        annot=True,
+        fmt=".4f",
+        cmap="Reds",
+        mask=np.eye(len(BASES5), dtype=bool),
+        linewidths=0.5,
+        cbar_kws={"label": "error rate (%)"},
+        ax=axes[0],
+    )
+    axes[0].set_xlabel("Observed base")
+    axes[0].set_ylabel("Consensus base")
+    axes[0].set_title(f"{prefix.name}: spectrum scaled to Skiver rate")
+
+    type_counts = error_type_counts(spectrum, "total")
+    type_rates = type_counts / type_counts.sum() * rate * 100 if type_counts.sum() else type_counts
+    axes[1].bar(type_rates.index, type_rates.values, color="slategray")
+    axes[1].set_ylabel("Error rate (%)")
+    axes[1].set_title("Error class distribution")
+
+    plt.tight_layout()
+    plt.show()
+```
+
+## Homopolymer Error Context
+
+This section uses the streamed `*.base_observations.tsv` summaries to ask whether error classes are more frequent after runs of the same nucleotide. Repeat context is event-inclusive: deleting one base from `AAA` is counted as context `3`, and inserting an `A` after `AA` is also counted as context `3`. Contexts are exact run lengths from `1` to `10`; longer runs are excluded from this context-specific summary rather than folded into a catch-all bin. The denominator is the number of consensus-base opportunities in each context, so elevated insertion or deletion rates indicate that errors are concentrated around homopolymers rather than spread evenly across sequence contexts.
+
+```{python}
+homopolymer_tables = []
+for summary in base_summaries:
+    if not summary["available"]:
+        continue
+    homopolymer = summary["homopolymer"].copy()
+    homopolymer.insert(0, "prefix", summary["prefix"])
+    homopolymer_tables.append(homopolymer)
+
+if homopolymer_tables:
+    homopolymer_df = pd.concat(homopolymer_tables, ignore_index=True)
+    display(homopolymer_df)
+else:
+    homopolymer_df = pd.DataFrame()
+    print("No base observations available for homopolymer error-context analysis.")
+```
+
+```{python}
+if not homopolymer_df.empty:
+    plot_rows = []
+    for _, row in homopolymer_df.iterrows():
+        for error_class in HOMOPOLYMER_ERROR_CLASSES:
+            plot_rows.append({
+                "prefix": row["prefix"],
+                "repeat_context": row["repeat_context"],
+                "error_class": error_class,
+                "rate": row[f"{error_class.lower()}_rate"],
+                "count": row[f"{error_class.lower()}_count"],
+                "opportunities": row["opportunities"],
+            })
+    homopolymer_plot_df = pd.DataFrame(plot_rows)
+
+    fig, axes = plt.subplots(1, len(PREFIXES), figsize=(6 * len(PREFIXES), 4), squeeze=False)
+    for ax, (prefix, sub) in zip(axes.ravel(), homopolymer_plot_df.groupby("prefix")):
+        sns.lineplot(
+            data=sub,
+            x="repeat_context",
+            y="rate",
+            hue="error_class",
+            marker="o",
+            linewidth=2,
+            ax=ax,
+        )
+        ax.set_xlabel("Event-inclusive repeat context")
+        ax.set_ylabel("Events per opportunity")
+        ax.set_title(prefix)
+        ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    plt.show()
+```
+
+```{python}
+if not homopolymer_df.empty:
+    indel_plot_df = homopolymer_plot_df[homopolymer_plot_df["error_class"].isin(["Insertion", "Deletion"])]
+
+    fig, axes = plt.subplots(1, len(PREFIXES), figsize=(6 * len(PREFIXES), 4), squeeze=False)
+    for ax, (prefix, sub) in zip(axes.ravel(), indel_plot_df.groupby("prefix")):
+        sns.barplot(
+            data=sub,
+            x="repeat_context",
+            y="rate",
+            hue="error_class",
+            ax=ax,
+        )
+        ax.set_xlabel("Event-inclusive repeat context")
+        ax.set_ylabel("Indel events per opportunity")
+        ax.set_title(f"{prefix}: indels by repeat context")
+        ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    plt.show()
+```
+
+## Spectrum Vs Value Position
+
+This section uses `*.summary_error_spectrum_dependence_on_t.csv`. It breaks the error spectrum down by position inside the value window. Position-specific shifts in insertion, deletion, or substitution composition can indicate that the error process is not constant across the survival window.
+
+```{python}
+for prefix in PREFIXES:
+    dep = read_csv(prefix, "spectrum_t").copy()
+    pos_cols = [c for c in dep.columns if c.startswith("freq_at_t")]
+    positions = [int(c.split("t")[-1]) for c in pos_cols]
+    dep["type"] = dep["operation"].apply(classify_op)
+    totals = dep[pos_cols].sum(axis=0)
+    valid_cols = [c for c in pos_cols if totals[c] > 0]
+    valid_positions = [positions[pos_cols.index(c)] for c in valid_cols]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    for etype in ["Substitution", "Insertion", "Deletion"]:
+        counts = dep.loc[dep["type"] == etype, valid_cols].sum(axis=0)
+        denom = totals[valid_cols].replace(0, np.nan)
+        axes[0].plot(valid_positions, counts / denom, marker="o", linewidth=2, label=etype)
+
+    axes[0].set_xlabel("t")
+    axes[0].set_ylabel("Proportion")
+    axes[0].set_title(f"{prefix.name}: error class by t")
+    axes[0].legend(fontsize=7)
+
+    top_ops = dep.groupby("operation")["total"].sum().sort_values(ascending=False).head(8).index
+    for op in top_ops:
+        counts = dep.loc[dep["operation"] == op, valid_cols].sum(axis=0)
+        denom = totals[valid_cols].replace(0, np.nan)
+        axes[1].plot(valid_positions, counts / denom, linewidth=1.5, label=op)
+
+    axes[1].set_xlabel("t")
+    axes[1].set_ylabel("Proportion")
+    axes[1].set_title("Top operations by t")
+    axes[1].legend(fontsize=7, ncol=2)
+
+    plt.tight_layout()
+    plt.show()
+```
+
+## Coverage And Filtering
+
+This section uses `*.kvmer.csv`, with one row per key. The pass/fail counts show how many keys survive Skiver's outlier filtering, while the coverage histograms show the distribution of total observations and consensus-supporting observations per key. Heavy tails or many low-coverage keys affect how much reliable consensus information is available.
+
+```{python}
+def positive_log_bins(values: pd.Series, bins: int = 60) -> np.ndarray | int:
+    positive = pd.Series(values).dropna()
+    positive = positive[positive > 0]
+    if positive.empty:
+        return bins
+    if positive.min() == positive.max():
+        return bins
+    return np.logspace(np.log10(positive.min()), np.log10(positive.max()), bins + 1)
+
+
+for prefix in PREFIXES:
+    kv = read_csv(prefix, "kvmer")
+    pass_counts = kv["passes_filter"].value_counts(dropna=False).rename_axis("passes_filter").reset_index(name="num_keys")
+    display(pd.DataFrame({"prefix": [prefix.name]}))
+    display(pass_counts)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    sns.histplot(kv["total_count"], bins=positive_log_bins(kv["total_count"]), ax=axes[0], color="slategray")
+    axes[0].set_xscale("log")
+    axes[0].set_xlabel("Total key observations")
+    axes[0].set_title("Total-count distribution")
+
+    sns.histplot(kv["consensus_count"], bins=positive_log_bins(kv["consensus_count"]), ax=axes[1], color="teal")
+    axes[1].set_xscale("log")
+    axes[1].set_xlabel("Consensus count")
+    axes[1].set_title("Consensus-count distribution")
+
+    plt.suptitle(prefix.name, y=1.03)
+    plt.tight_layout()
+    plt.show()
+```

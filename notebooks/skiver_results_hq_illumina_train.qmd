@@ -1,0 +1,24 @@
+---
+title: "Skiver Results: hq-illumina train"
+jupyter: skiver
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  execute-dir: file
+---
+
+```{python}
+SAMPLE_NAME = "hq-illumina"
+SPLIT_NAME = "train"
+RESULT_DIR = "../../skiver_run/hq-illumina/train"
+```
+
+{{< include skiver_results_template.qmd >}}
