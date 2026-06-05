@@ -65,6 +65,8 @@ class ModelSpec:
         phred_lags: Number of previous Phred quality scores to use as covariates.
         position_features: Number of read-position features to use as covariates
             (0–2). Feature order: log1p(dist_to_end), log1p(read_pos).
+        use_strand: If True, include the forward-strand fraction per context as a
+            scalar covariate.
     """
 
     id: str
@@ -72,6 +74,7 @@ class ModelSpec:
     context_length: int
     phred_lags: int = 0
     position_features: int = 0
+    use_strand: bool = False
 
     def __post_init__(self) -> None:
         if self.type not in MODEL_TYPES:
@@ -121,6 +124,7 @@ def load_model_config(path: Path) -> list[ModelSpec]:
             context_length=int(entry["context_length"]),
             phred_lags=int(entry.get("phred_lags", 0)),
             position_features=int(entry.get("position_features", 0)),
+            use_strand=bool(entry.get("use_strand", False)),
         )
         if spec.id in seen_ids:
             raise ValueError(f"{path}: duplicate model id {spec.id!r}")
@@ -166,13 +170,14 @@ def _counts_for_spec(
     max_contexts: int | None = None,
     phred_lags_override: int = 0,
     position_features_override: int = 0,
+    strand_override: bool = False,
 ) -> ContextCounts:
-    """Return context counts with additive_context and phred/position lags set per the model spec.
+    """Return context counts with additive_context and phred/position/strand covariates set per spec.
 
     For additive_context models, optionally cap to the top-``max_contexts``
     most-observed context rows to bound training time. Phred and position sums are
     truncated to the effective lag/feature count (max of spec and override), or
-    stripped when 0.
+    stripped when 0. Strand sums are stripped unless the spec or override enables them.
     """
     base = screen_counts.by_length[spec.context_length]
     if base.additive_context != spec.additive_context:
@@ -195,6 +200,9 @@ def _counts_for_spec(
             position_sums = position_sums[..., :effective_pos]
     if position_sums is not base.position_context_sums:
         base = dataclasses.replace(base, position_context_sums=position_sums)
+    effective_strand = spec.use_strand or strand_override
+    if not effective_strand and base.strand_context_sums is not None:
+        base = dataclasses.replace(base, strand_context_sums=None)
     if spec.additive_context and max_contexts is not None:
         base = subsample_context_counts(base, max_contexts)
     return base
@@ -460,6 +468,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--strand-covariate",
+        action="store_true",
+        default=False,
+        help=(
+            "Include the forward-strand fraction per context as a scalar covariate. "
+            "Global override: enables strand for all models regardless of per-model "
+            "use_strand in the model config."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -477,6 +495,7 @@ def _aggregate_with_progress(
     context_lengths: Sequence[int],
     num_phred_lags: int = 0,
     num_position_features: int = 0,
+    use_strand: bool = False,
 ) -> ContextLengthScreenCounts:
     """Aggregate all context-length counts while rendering a Rich progress bar."""
     state = {"scanned": 0, "accepted": 0, "skipped": 0}
@@ -527,6 +546,7 @@ def _aggregate_with_progress(
             progress_interval=PROGRESS_INTERVAL,
             num_phred_lags=num_phred_lags,
             num_position_features=num_position_features,
+            use_strand=use_strand,
         )
 
 
@@ -650,11 +670,12 @@ def _load_counts(
     context_lengths: Sequence[int],
     num_phred_lags: int = 0,
     num_position_features: int = 0,
+    use_strand: bool = False,
     args: argparse.Namespace,
 ) -> ContextLengthScreenCounts:
     """Load counts from HDF5 cache when possible, otherwise parse TSVs."""
-    # H5 cache does not store Phred or position scores; bypass when either is active.
-    use_cache = not args.no_cache and num_phred_lags == 0 and num_position_features == 0
+    # H5 cache does not store Phred, position, or strand scores; bypass when any is active.
+    use_cache = not args.no_cache and num_phred_lags == 0 and num_position_features == 0 and not use_strand
     if use_cache:
         h5_path = cache_path(args.cache_dir, platform, split, include_outliers)
         cached_counts = _aggregate_row_cache_with_progress(
@@ -687,10 +708,10 @@ def _load_counts(
             if cached_counts is not None:
                 return cached_counts
         logger.info("%s/%s HDF5 row cache unavailable; parsing TSV files", platform, split)
-    elif num_phred_lags > 0 or num_position_features > 0:
+    elif num_phred_lags > 0 or num_position_features > 0 or use_strand:
         logger.info(
-            "%s/%s phred_lags=%d position_features=%d: bypassing H5 cache, parsing TSV files",
-            platform, split, num_phred_lags, num_position_features,
+            "%s/%s phred_lags=%d position_features=%d use_strand=%s: bypassing H5 cache, parsing TSV files",
+            platform, split, num_phred_lags, num_position_features, use_strand,
         )
     else:
         logger.info("%s/%s cache disabled; parsing TSV files", platform, split)
@@ -703,6 +724,7 @@ def _load_counts(
         context_lengths=context_lengths,
         num_phred_lags=num_phred_lags,
         num_position_features=num_position_features,
+        use_strand=use_strand,
     )
     if args.write_cache and num_phred_lags == 0:
         require_h5py()
@@ -915,6 +937,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     max_position_features = max(max(spec.position_features for spec in model_specs), args.position_features)
     if max_position_features > 0:
         logger.info("Max position_features across all specs: %d", max_position_features)
+    use_strand_any = any(s.use_strand for s in model_specs) or args.strand_covariate
+    if use_strand_any:
+        logger.info("Strand covariate enabled")
 
     platforms = tuple(args.platform) if args.platform else DEFAULT_PLATFORMS
     logger.info("Platforms: %s", ", ".join(platforms))
@@ -959,6 +984,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             context_lengths=context_lengths,
             num_phred_lags=max_phred_lags,
             num_position_features=max_position_features,
+            use_strand=use_strand_any,
             args=args,
         )
         logger.info(
@@ -978,6 +1004,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 context_lengths=context_lengths,
                 num_phred_lags=max_phred_lags,
                 num_position_features=max_position_features,
+                use_strand=use_strand_any,
                 args=args,
             )
         logger.info(
@@ -988,8 +1015,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         for spec in model_specs:
-            train_counts = _counts_for_spec(spec, train_platform_counts, max_contexts=args.max_contexts, phred_lags_override=args.phred_lags, position_features_override=args.position_features)
-            test_counts = _counts_for_spec(spec, test_platform_counts, phred_lags_override=args.phred_lags, position_features_override=args.position_features)
+            train_counts = _counts_for_spec(spec, train_platform_counts, max_contexts=args.max_contexts, phred_lags_override=args.phred_lags, position_features_override=args.position_features, strand_override=args.strand_covariate)
+            test_counts = _counts_for_spec(spec, test_platform_counts, phred_lags_override=args.phred_lags, position_features_override=args.position_features, strand_override=args.strand_covariate)
 
             mle_fit, vi_fit, n_train, n_test, low_count_contexts = _run_model(
                 platform=platform,
@@ -1009,6 +1036,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     context_indices=train_counts.context_indices,
                     phred_context_sums=train_counts.phred_context_sums,
                     position_context_sums=train_counts.position_context_sums,
+                    strand_context_sums=train_counts.strand_context_sums,
                 )
                 delta_mle = calibrate_to_rate(
                     train_counts.counts,
@@ -1019,6 +1047,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     context_indices=train_counts.context_indices,
                     phred_context_sums=train_counts.phred_context_sums,
                     position_context_sums=train_counts.position_context_sums,
+                    strand_context_sums=train_counts.strand_context_sums,
                 )
                 raw_vi = compute_marginal_error_rate(
                     train_counts.counts,
@@ -1028,6 +1057,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     context_indices=train_counts.context_indices,
                     phred_context_sums=train_counts.phred_context_sums,
                     position_context_sums=train_counts.position_context_sums,
+                    strand_context_sums=train_counts.strand_context_sums,
                 )
                 delta_vi = calibrate_to_rate(
                     train_counts.counts,
@@ -1038,6 +1068,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     context_indices=train_counts.context_indices,
                     phred_context_sums=train_counts.phred_context_sums,
                     position_context_sums=train_counts.position_context_sums,
+                    strand_context_sums=train_counts.strand_context_sums,
                 )
                 calibration = {
                     "weibull_target_rate": args.weibull_rate,
