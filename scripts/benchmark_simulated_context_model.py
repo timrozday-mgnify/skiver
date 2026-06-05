@@ -2224,7 +2224,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-simulation",
         action="store_true",
-        help="Skip genome-blender generation and use --train-reads/--test-reads.",
+        help=(
+            "Skip genome-blender generation and use --reads (no split) "
+            "or --train-reads/--test-reads."
+        ),
+    )
+    parser.add_argument(
+        "--reads",
+        type=Path,
+        nargs="+",
+        default=None,
+        help=(
+            "Pre-generated FASTQ(s) used with --skip-simulation (no train/test split). "
+            "Pass both R1 and R2 files for paired-end data. "
+            "Mutually exclusive with --train-reads/--test-reads."
+        ),
     )
     parser.add_argument(
         "--train-reads",
@@ -2429,10 +2443,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     qcal_metrics_path = args.output_dir / "quality_calibration_model_metrics.json"
 
     if args.skip_simulation:
-        if args.train_reads is None or args.test_reads is None:
-            raise ValueError("--skip-simulation requires --train-reads and --test-reads")
-        train_reads = args.train_reads
-        test_reads = args.test_reads
+        if args.reads is not None:
+            train_reads = test_reads = args.reads
+        elif args.train_reads is not None and args.test_reads is not None:
+            train_reads = args.train_reads
+            test_reads = args.test_reads
+        else:
+            raise ValueError(
+                "--skip-simulation requires --reads or both --train-reads and --test-reads"
+            )
     else:
         genome_blender_cmd = _genome_blender_command(
             genome_blender_dir=args.genome_blender_dir,

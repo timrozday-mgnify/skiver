@@ -62,11 +62,16 @@ class ModelSpec:
         type: Parameterisation — ``"combinatorial_context"`` (full joint) or
             ``"additive_context"`` (factored over positions).
         context_length: Number of preceding consensus bases to condition on.
+        phred_lags: Number of previous Phred quality scores to use as covariates.
+        position_features: Number of read-position features to use as covariates
+            (0–2). Feature order: log1p(dist_to_end), log1p(read_pos).
     """
 
     id: str
     type: str
     context_length: int
+    phred_lags: int = 0
+    position_features: int = 0
 
     def __post_init__(self) -> None:
         if self.type not in MODEL_TYPES:
@@ -75,6 +80,10 @@ class ModelSpec:
             )
         if self.context_length < 1:
             raise ValueError("context_length must be at least 1")
+        if self.phred_lags < 0:
+            raise ValueError("phred_lags must be non-negative")
+        if not (0 <= self.position_features <= 2):
+            raise ValueError("position_features must be 0, 1, or 2")
 
     @property
     def additive_context(self) -> bool:
@@ -110,6 +119,8 @@ def load_model_config(path: Path) -> list[ModelSpec]:
             id=str(entry["id"]),
             type=str(entry["type"]),
             context_length=int(entry["context_length"]),
+            phred_lags=int(entry.get("phred_lags", 0)),
+            position_features=int(entry.get("position_features", 0)),
         )
         if spec.id in seen_ids:
             raise ValueError(f"{path}: duplicate model id {spec.id!r}")
@@ -130,10 +141,14 @@ def _prefix_from_base_path(path: Path) -> Path:
     return Path(text[: -len(suffix)])
 
 
-def discover_prefixes(data_root: Path, platform: str, split: str) -> list[Path]:
-    """Return sorted skiver dump prefixes for a platform/split."""
-    split_dir = data_root / platform / split
-    paths = sorted(split_dir.glob("*.base_observations.tsv"))
+def discover_prefixes(data_root: Path, platform: str, split: str | None) -> list[Path]:
+    """Return sorted skiver dump prefixes for a platform/split.
+
+    When ``split`` is ``None`` (--no-split mode), globs directly in
+    ``data_root/platform/`` without a train/test subdirectory.
+    """
+    search_dir = data_root / platform if split is None else data_root / platform / split
+    paths = sorted(search_dir.glob("*.base_observations.tsv"))
     return [_prefix_from_base_path(path) for path in paths]
 
 
@@ -149,15 +164,37 @@ def _counts_for_spec(
     screen_counts: ContextLengthScreenCounts,
     *,
     max_contexts: int | None = None,
+    phred_lags_override: int = 0,
+    position_features_override: int = 0,
 ) -> ContextCounts:
-    """Return context counts with additive_context set per the model spec.
+    """Return context counts with additive_context and phred/position lags set per the model spec.
 
     For additive_context models, optionally cap to the top-``max_contexts``
-    most-observed context rows to bound training time.
+    most-observed context rows to bound training time. Phred and position sums are
+    truncated to the effective lag/feature count (max of spec and override), or
+    stripped when 0.
     """
     base = screen_counts.by_length[spec.context_length]
     if base.additive_context != spec.additive_context:
         base = dataclasses.replace(base, additive_context=spec.additive_context)
+    effective_lags = max(spec.phred_lags, phred_lags_override)
+    phred_sums = base.phred_context_sums
+    if phred_sums is not None:
+        if effective_lags == 0:
+            phred_sums = None
+        elif phred_sums.shape[-1] > effective_lags:
+            phred_sums = phred_sums[..., :effective_lags]
+    if phred_sums is not base.phred_context_sums:
+        base = dataclasses.replace(base, phred_context_sums=phred_sums)
+    effective_pos = max(spec.position_features, position_features_override)
+    position_sums = base.position_context_sums
+    if position_sums is not None:
+        if effective_pos == 0:
+            position_sums = None
+        elif position_sums.shape[-1] > effective_pos:
+            position_sums = position_sums[..., :effective_pos]
+    if position_sums is not base.position_context_sums:
+        base = dataclasses.replace(base, position_context_sums=position_sums)
     if spec.additive_context and max_contexts is not None:
         base = subsample_context_counts(base, max_contexts)
     return base
@@ -367,6 +404,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Include observations from keys that failed the outlier filter.",
     )
     parser.add_argument(
+        "--no-split",
+        action="store_true",
+        help=(
+            "Disable train/test split: look for TSV files directly in "
+            "<data-root>/<platform>/ instead of the train/ and test/ subdirectories. "
+            "Training data is used for both fitting and evaluation."
+        ),
+    )
+    parser.add_argument(
         "--max-contexts",
         type=int,
         default=None,
@@ -391,6 +437,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--phred-lags",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of previous Phred quality scores to use as context covariates "
+            "(overrides per-model phred_lags from model config; 0 = disabled). "
+            "Applied as a global override: all model specs get at least this many lags."
+        ),
+    )
+    parser.add_argument(
+        "--position-features",
+        type=int,
+        default=0,
+        metavar="N",
+        choices=(0, 1, 2),
+        help=(
+            "Number of read-position features to use as context covariates (0–2). "
+            "Feature order: log1p(dist_to_end), log1p(read_pos). "
+            "Overrides per-model position_features from model config; 0 = disabled."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -406,6 +475,8 @@ def _aggregate_with_progress(
     prefixes: Sequence[Path],
     include_outliers: bool,
     context_lengths: Sequence[int],
+    num_phred_lags: int = 0,
+    num_position_features: int = 0,
 ) -> ContextLengthScreenCounts:
     """Aggregate all context-length counts while rendering a Rich progress bar."""
     state = {"scanned": 0, "accepted": 0, "skipped": 0}
@@ -454,6 +525,8 @@ def _aggregate_with_progress(
             passes_filter_only=not include_outliers,
             progress_callback=update_progress,
             progress_interval=PROGRESS_INTERVAL,
+            num_phred_lags=num_phred_lags,
+            num_position_features=num_position_features,
         )
 
 
@@ -575,11 +648,15 @@ def _load_counts(
     prefixes: Sequence[Path],
     include_outliers: bool,
     context_lengths: Sequence[int],
+    num_phred_lags: int = 0,
+    num_position_features: int = 0,
     args: argparse.Namespace,
 ) -> ContextLengthScreenCounts:
     """Load counts from HDF5 cache when possible, otherwise parse TSVs."""
-    h5_path = cache_path(args.cache_dir, platform, split, include_outliers)
-    if not args.no_cache:
+    # H5 cache does not store Phred or position scores; bypass when either is active.
+    use_cache = not args.no_cache and num_phred_lags == 0 and num_position_features == 0
+    if use_cache:
+        h5_path = cache_path(args.cache_dir, platform, split, include_outliers)
         cached_counts = _aggregate_row_cache_with_progress(
             platform=platform,
             split=split,
@@ -610,6 +687,11 @@ def _load_counts(
             if cached_counts is not None:
                 return cached_counts
         logger.info("%s/%s HDF5 row cache unavailable; parsing TSV files", platform, split)
+    elif num_phred_lags > 0 or num_position_features > 0:
+        logger.info(
+            "%s/%s phred_lags=%d position_features=%d: bypassing H5 cache, parsing TSV files",
+            platform, split, num_phred_lags, num_position_features,
+        )
     else:
         logger.info("%s/%s cache disabled; parsing TSV files", platform, split)
 
@@ -619,8 +701,10 @@ def _load_counts(
         prefixes=prefixes,
         include_outliers=include_outliers,
         context_lengths=context_lengths,
+        num_phred_lags=num_phred_lags,
+        num_position_features=num_position_features,
     )
-    if args.write_cache:
+    if args.write_cache and num_phred_lags == 0:
         require_h5py()
         _row_cache_with_progress(
             platform=platform,
@@ -825,6 +909,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     context_lengths = sorted({spec.context_length for spec in model_specs})
     logger.info("Context lengths required: %s", ", ".join(str(i) for i in context_lengths))
+    max_phred_lags = max(max(spec.phred_lags for spec in model_specs), args.phred_lags)
+    if max_phred_lags > 0:
+        logger.info("Max phred_lags across all specs: %d", max_phred_lags)
+    max_position_features = max(max(spec.position_features for spec in model_specs), args.position_features)
+    if max_position_features > 0:
+        logger.info("Max position_features across all specs: %d", max_position_features)
 
     platforms = tuple(args.platform) if args.platform else DEFAULT_PLATFORMS
     logger.info("Platforms: %s", ", ".join(platforms))
@@ -832,22 +922,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows: list[dict[str, object]] = []
 
     for platform in platforms:
-        train_prefixes = discover_prefixes(args.data_root, platform, "train")
-        test_prefixes = discover_prefixes(args.data_root, platform, "test")
-        logger.info(
-            "%s discovered prefixes: train=%d test=%d",
-            platform,
-            len(train_prefixes),
-            len(test_prefixes),
-        )
+        if args.no_split:
+            train_prefixes = discover_prefixes(args.data_root, platform, None)
+            test_prefixes = train_prefixes
+            logger.info(
+                "%s discovered prefixes (no-split): %d",
+                platform,
+                len(train_prefixes),
+            )
+        else:
+            train_prefixes = discover_prefixes(args.data_root, platform, "train")
+            test_prefixes = discover_prefixes(args.data_root, platform, "test")
+            logger.info(
+                "%s discovered prefixes: train=%d test=%d",
+                platform,
+                len(train_prefixes),
+                len(test_prefixes),
+            )
         if not train_prefixes or not test_prefixes:
             logger.warning("Skipping %s: missing train or test prefixes", platform)
             continue
         logger.debug("Train prefixes: %s", _prefix_summary(train_prefixes))
-        logger.debug("Test prefixes: %s", _prefix_summary(test_prefixes))
+        if not args.no_split:
+            logger.debug("Test prefixes: %s", _prefix_summary(test_prefixes))
 
         logger.info(
-            "%s loading train/test data once for context lengths %s",
+            "%s loading data for context lengths %s",
             platform,
             ", ".join(str(i) for i in context_lengths),
         )
@@ -857,6 +957,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             prefixes=train_prefixes,
             include_outliers=args.include_outliers,
             context_lengths=context_lengths,
+            num_phred_lags=max_phred_lags,
+            num_position_features=max_position_features,
             args=args,
         )
         logger.info(
@@ -865,14 +967,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             train_platform_counts.total_observations,
             train_platform_counts.skipped_rows,
         )
-        test_platform_counts = _load_counts(
-            platform=platform,
-            split="test",
-            prefixes=test_prefixes,
-            include_outliers=args.include_outliers,
-            context_lengths=context_lengths,
-            args=args,
-        )
+        if args.no_split:
+            test_platform_counts = train_platform_counts
+        else:
+            test_platform_counts = _load_counts(
+                platform=platform,
+                split="test",
+                prefixes=test_prefixes,
+                include_outliers=args.include_outliers,
+                context_lengths=context_lengths,
+                num_phred_lags=max_phred_lags,
+                num_position_features=max_position_features,
+                args=args,
+            )
         logger.info(
             "%s test loaded: accepted=%d skipped=%d",
             platform,
@@ -881,8 +988,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         for spec in model_specs:
-            train_counts = _counts_for_spec(spec, train_platform_counts, max_contexts=args.max_contexts)
-            test_counts = _counts_for_spec(spec, test_platform_counts)
+            train_counts = _counts_for_spec(spec, train_platform_counts, max_contexts=args.max_contexts, phred_lags_override=args.phred_lags, position_features_override=args.position_features)
+            test_counts = _counts_for_spec(spec, test_platform_counts, phred_lags_override=args.phred_lags, position_features_override=args.position_features)
 
             mle_fit, vi_fit, n_train, n_test, low_count_contexts = _run_model(
                 platform=platform,
@@ -900,6 +1007,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_values=train_counts.run_values,
                     additive_context=train_counts.additive_context,
                     context_indices=train_counts.context_indices,
+                    phred_context_sums=train_counts.phred_context_sums,
+                    position_context_sums=train_counts.position_context_sums,
                 )
                 delta_mle = calibrate_to_rate(
                     train_counts.counts,
@@ -908,6 +1017,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_values=train_counts.run_values,
                     additive_context=train_counts.additive_context,
                     context_indices=train_counts.context_indices,
+                    phred_context_sums=train_counts.phred_context_sums,
+                    position_context_sums=train_counts.position_context_sums,
                 )
                 raw_vi = compute_marginal_error_rate(
                     train_counts.counts,
@@ -915,6 +1026,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_values=train_counts.run_values,
                     additive_context=train_counts.additive_context,
                     context_indices=train_counts.context_indices,
+                    phred_context_sums=train_counts.phred_context_sums,
+                    position_context_sums=train_counts.position_context_sums,
                 )
                 delta_vi = calibrate_to_rate(
                     train_counts.counts,
@@ -923,6 +1036,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_values=train_counts.run_values,
                     additive_context=train_counts.additive_context,
                     context_indices=train_counts.context_indices,
+                    phred_context_sums=train_counts.phred_context_sums,
+                    position_context_sums=train_counts.position_context_sums,
                 )
                 calibration = {
                     "weibull_target_rate": args.weibull_rate,

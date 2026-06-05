@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import sys
+from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 import dataclasses
 from dataclasses import dataclass
@@ -55,6 +56,8 @@ class ContextCounts:
     scalar_run: bool = False
     additive_context: bool = False
     context_indices: torch.Tensor | None = None
+    phred_context_sums: torch.Tensor | None = None
+    position_context_sums: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -542,7 +545,9 @@ def _aggregate_one_prefix_screen(
     prefix: str,
     context_lengths: Sequence[int],
     passes_filter_only: bool,
-) -> tuple[dict[int, "torch.Tensor"], dict[int, int], dict[int, int], int, int] | None:
+    num_phred_lags: int = 0,
+    num_position_features: int = 0,
+) -> tuple[dict[int, "torch.Tensor"], dict[int, int], dict[int, int], int, int, dict[int, "torch.Tensor"], dict[int, "torch.Tensor"]] | None:
     """Aggregate a single prefix into its own count tensors (process-pool worker).
 
     Returns ``None`` if the file is missing. The per-file count tensors are summed
@@ -560,17 +565,33 @@ def _aggregate_one_prefix_screen(
         )
         for model in models
     }
+    phred_sums = {
+        model.context_length: torch.zeros(
+            *model.context_shape, num_phred_lags, dtype=torch.float32
+        )
+        for model in models
+    } if num_phred_lags > 0 else {}
+    position_sums = {
+        model.context_length: torch.zeros(
+            *model.context_shape, num_position_features, dtype=torch.float32
+        )
+        for model in models
+    } if num_position_features > 0 else {}
     file_totals, file_skipped_by_length, file_total, file_skipped = (
         _aggregate_context_length_screen_file(
             path,
             models,
             count_tensors,
+            phred_context_sums_by_length=phred_sums,
+            num_phred_lags=num_phred_lags,
+            position_context_sums_by_length=position_sums,
+            num_position_features=num_position_features,
             passes_filter_only=passes_filter_only,
             progress_callback=None,
             progress_interval=10_000,
         )
     )
-    return count_tensors, file_totals, file_skipped_by_length, file_total, file_skipped
+    return count_tensors, file_totals, file_skipped_by_length, file_total, file_skipped, phred_sums, position_sums
 
 
 def aggregate_context_length_screen_counts(
@@ -581,6 +602,8 @@ def aggregate_context_length_screen_counts(
     progress_callback: ProgressCallback | None = None,
     progress_interval: int = 10_000,
     max_workers: int | None = None,
+    num_phred_lags: int = 0,
+    num_position_features: int = 0,
 ) -> ContextLengthScreenCounts:
     """Aggregate previous-base context models in one pass over TSV files.
 
@@ -598,6 +621,11 @@ def aggregate_context_length_screen_counts(
             ``min(#files, os.cpu_count())``. ``1`` forces the serial path. The
             per-file count tensors are summed, which is associative — the result is
             identical to serial aggregation.
+        num_phred_lags: Number of previous Phred quality scores to accumulate as
+            context covariates. 0 disables Phred context (default).
+        num_position_features: Number of read-position features to accumulate as
+            context covariates. 0 disables position context (default). Features in
+            order: log1p(dist_to_end), log1p(read_pos).
 
     Returns:
         Counts keyed by context length.
@@ -616,6 +644,14 @@ def aggregate_context_length_screen_counts(
         )
         for model in models
     }
+    phred_sum_tensors: dict[int, torch.Tensor] = {
+        model.context_length: torch.zeros(*model.context_shape, num_phred_lags, dtype=torch.float32)
+        for model in models
+    } if num_phred_lags > 0 else {}
+    position_sum_tensors: dict[int, torch.Tensor] = {
+        model.context_length: torch.zeros(*model.context_shape, num_position_features, dtype=torch.float32)
+        for model in models
+    } if num_position_features > 0 else {}
     totals_by_length = {model.context_length: 0 for model in models}
     skipped_by_length = {model.context_length: 0 for model in models}
 
@@ -630,9 +666,13 @@ def aggregate_context_length_screen_counts(
         nonlocal total_observations, skipped_rows
         if result is None:
             return
-        file_tensors, file_totals, file_skipped_by_length, file_total, file_skipped = result
+        file_tensors, file_totals, file_skipped_by_length, file_total, file_skipped, file_phred, file_position = result
         for length, tensor in file_tensors.items():
             count_tensors[length] += tensor
+        for length, psums in file_phred.items():
+            phred_sum_tensors[length] += psums
+        for length, possums in file_position.items():
+            position_sum_tensors[length] += possums
         for length, total in file_totals.items():
             totals_by_length[length] += total
         for length, skipped in file_skipped_by_length.items():
@@ -645,7 +685,12 @@ def aggregate_context_length_screen_counts(
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = {
                 pool.submit(
-                    _aggregate_one_prefix_screen, prefix, list(context_lengths), passes_filter_only
+                    _aggregate_one_prefix_screen,
+                    prefix,
+                    list(context_lengths),
+                    passes_filter_only,
+                    num_phred_lags,
+                    num_position_features,
                 ): prefix
                 for prefix in prefix_list
             }
@@ -665,6 +710,10 @@ def aggregate_context_length_screen_counts(
                     path,
                     models,
                     count_tensors,
+                    phred_context_sums_by_length=phred_sum_tensors,
+                    num_phred_lags=num_phred_lags,
+                    position_context_sums_by_length=position_sum_tensors,
+                    num_position_features=num_position_features,
                     passes_filter_only=passes_filter_only,
                     progress_callback=progress_callback,
                     progress_interval=progress_interval,
@@ -682,6 +731,8 @@ def aggregate_context_length_screen_counts(
     for model in models:
         counts = count_tensors[model.context_length]
         context_totals = _context_totals(counts)
+        phred_sums = phred_sum_tensors.get(model.context_length)
+        position_sums = position_sum_tensors.get(model.context_length)
         by_length[model.context_length] = ContextCounts(
             counts=counts,
             run_values=None,
@@ -690,6 +741,8 @@ def aggregate_context_length_screen_counts(
             low_count_contexts=int((context_totals < 10).sum().item()),
             context_shape=model.context_shape,
             scalar_run=False,
+            phred_context_sums=phred_sums,
+            position_context_sums=position_sums,
         )
 
     return ContextLengthScreenCounts(
@@ -704,6 +757,10 @@ def _aggregate_context_length_screen_file(
     models: Sequence[PreviousBasesErrorModel],
     count_tensors: dict[int, torch.Tensor],
     *,
+    phred_context_sums_by_length: dict[int, torch.Tensor],
+    num_phred_lags: int = 0,
+    position_context_sums_by_length: dict[int, torch.Tensor],
+    num_position_features: int = 0,
     passes_filter_only: bool,
     progress_callback: ProgressCallback | None,
     progress_interval: int,
@@ -715,6 +772,7 @@ def _aggregate_context_length_screen_file(
     )
     current_obs_id: int | None = None
     history: list[str] = []
+    phred_history: deque[float] = deque([0.0] * num_phred_lags, maxlen=num_phred_lags) if num_phred_lags > 0 else deque()
     totals_by_length = {model.context_length: 0 for model in models}
     skipped_by_length = {model.context_length: 0 for model in models}
     total_observations = 0
@@ -752,6 +810,10 @@ def _aggregate_context_length_screen_file(
             "edit_op",
             "passes_filter",
         }
+        if num_phred_lags > 0:
+            required.add("phred")
+        if num_position_features > 0:
+            required.update(["dist_to_end", "read_pos"])
         missing = required.difference(reader.fieldnames or [])
         if missing:
             raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
@@ -774,6 +836,8 @@ def _aggregate_context_length_screen_file(
                 history = _lookup_raw_context_history(raw_obs_ids, raw_codes, raw_max_context, obs_id)
                 if not history:
                     history = [row_prev_base] if row_prev_base is not None else []
+                if num_phred_lags > 0:
+                    phred_history = deque([0.0] * num_phred_lags, maxlen=num_phred_lags)
 
             target = encode_error_type(
                 row["true_base"],
@@ -781,6 +845,12 @@ def _aggregate_context_length_screen_file(
                 row["edit_op"],
             )
             true_base_bin = _true_base_bin(row["true_base"])
+            pos_feats: list[float] = []
+            if num_position_features > 0:
+                dist_to_end = max(0.0, float(row["dist_to_end"]))
+                read_pos = max(0.0, float(row["read_pos"]))
+                all_pos = [math.log1p(dist_to_end), math.log1p(read_pos)]
+                pos_feats = all_pos[:num_position_features]
             for model in models:
                 if len(history) < model.context_length:
                     skipped_by_length[model.context_length] += 1
@@ -790,6 +860,17 @@ def _aggregate_context_length_screen_file(
                     (*context_idx, true_base_bin, target)
                 ] += 1
                 totals_by_length[model.context_length] += 1
+                if num_phred_lags > 0:
+                    flat_ctx = context_idx[0]
+                    phred_list = list(phred_history)
+                    for k in range(num_phred_lags):
+                        lag_idx = len(phred_list) - 1 - k
+                        lag_val = phred_list[lag_idx] if lag_idx >= 0 else 0.0
+                        phred_context_sums_by_length[model.context_length][flat_ctx, k] += lag_val
+                if num_position_features > 0:
+                    flat_ctx = context_idx[0]
+                    for f, pval in enumerate(pos_feats):
+                        position_context_sums_by_length[model.context_length][flat_ctx, f] += pval
 
             total_observations += 1
             accepted_since_callback += 1
@@ -797,6 +878,9 @@ def _aggregate_context_length_screen_file(
             true_base = _normalise_context_base(row["true_base"])
             if true_base is not None:
                 history.append(true_base)
+                if num_phred_lags > 0:
+                    phred_val = max(0.0, float(row["phred"]))
+                    phred_history.append(phred_val)
 
             if scanned_since_callback >= progress_interval:
                 flush_progress()
@@ -1041,6 +1125,8 @@ def context_error_model(
     run_values: torch.Tensor | None,
     additive_context: bool = False,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> None:
     """Pyro model for aggregated conditional categorical observations."""
     if additive_context:
@@ -1054,6 +1140,22 @@ def context_error_model(
         )
     else:
         logits = pyro.param("logits", init_logits)
+    if phred_context_sums is not None:
+        num_lags = phred_context_sums.shape[-1]
+        context_totals = counts.reshape(counts.shape[0], -1).sum(dim=-1, keepdim=True).clamp(min=1)
+        mean_phred = phred_context_sums / context_totals
+        phred_weights = pyro.param(
+            "phred_weights", torch.zeros(num_lags, NUM_ERROR_TYPES, dtype=logits.dtype)
+        )
+        logits = logits + mean_phred @ phred_weights
+    if position_context_sums is not None:
+        num_pos = position_context_sums.shape[-1]
+        context_totals = counts.reshape(counts.shape[0], -1).sum(dim=-1, keepdim=True).clamp(min=1)
+        mean_pos = position_context_sums / context_totals
+        position_weights = pyro.param(
+            "position_weights", torch.zeros(num_pos, NUM_ERROR_TYPES, dtype=logits.dtype)
+        )
+        logits = logits + mean_pos @ position_weights
     if run_values is not None:
         run_slopes = pyro.param("run_slopes", torch.zeros_like(init_logits))
         run_step_unconstrained = pyro.param(
@@ -1198,6 +1300,8 @@ def bayesian_context_error_model(
     prior_scale: float,
     additive_context: bool = False,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> None:
     """Bayesian context error model with Normal priors over logit parameters."""
     if additive_context:
@@ -1222,6 +1326,30 @@ def bayesian_context_error_model(
                 init_logits.dim()
             ),
         )
+    if phred_context_sums is not None:
+        num_lags = phred_context_sums.shape[-1]
+        context_totals = counts.reshape(counts.shape[0], -1).sum(dim=-1, keepdim=True).clamp(min=1)
+        mean_phred = phred_context_sums / context_totals
+        phred_weights = pyro.sample(
+            "phred_weights",
+            dist.Normal(
+                torch.zeros(num_lags, NUM_ERROR_TYPES, dtype=logits.dtype),
+                prior_scale,
+            ).to_event(2),
+        )
+        logits = logits + mean_phred @ phred_weights
+    if position_context_sums is not None:
+        num_pos = position_context_sums.shape[-1]
+        context_totals = counts.reshape(counts.shape[0], -1).sum(dim=-1, keepdim=True).clamp(min=1)
+        mean_pos = position_context_sums / context_totals
+        position_weights = pyro.sample(
+            "position_weights",
+            dist.Normal(
+                torch.zeros(num_pos, NUM_ERROR_TYPES, dtype=logits.dtype),
+                prior_scale,
+            ).to_event(2),
+        )
+        logits = logits + mean_pos @ position_weights
     run_slopes = None
     run_step_unconstrained = None
     if run_values is not None:
@@ -1255,9 +1383,11 @@ def empty_guide(
     run_values: torch.Tensor | None,
     additive_context: bool = False,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> None:
     """Empty guide for maximum-likelihood optimisation."""
-    del counts, init_logits, run_values, additive_context, context_indices
+    del counts, init_logits, run_values, additive_context, context_indices, phred_context_sums, position_context_sums
 
 
 def initialise_logits(counts: torch.Tensor, *, pseudo_count: float = 0.5) -> torch.Tensor:
@@ -1274,6 +1404,8 @@ def train_counts(
     additive_context: bool = False,
     context_length: int | None = None,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
     lr: float = 0.05,
     num_steps: int = 1000,
     clip_norm: float = 10.0,
@@ -1326,7 +1458,7 @@ def train_counts(
 
     losses = []
     for step in range(num_steps):
-        loss = float(svi.step(counts, init_logits, run_values, additive_context, context_indices))
+        loss = float(svi.step(counts, init_logits, run_values, additive_context, context_indices, phred_context_sums, position_context_sums))
         losses.append(loss)
         if progress_callback is not None:
             progress_callback(step, loss)
@@ -1368,6 +1500,8 @@ def train_bayesian_counts(
     additive_context: bool = False,
     context_length: int | None = None,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
     lr: float = 0.01,
     num_steps: int = 1000,
     clip_norm: float = 10.0,
@@ -1410,6 +1544,13 @@ def train_bayesian_counts(
             run_values.numel() - 1,
             dtype=init_logits.dtype,
         )
+    _logit_dtype = init_logits[0].dtype if isinstance(init_logits, tuple) else init_logits.dtype
+    if phred_context_sums is not None:
+        num_lags = phred_context_sums.shape[-1]
+        init_values["phred_weights"] = torch.zeros(num_lags, NUM_ERROR_TYPES, dtype=_logit_dtype)
+    if position_context_sums is not None:
+        num_pos = position_context_sums.shape[-1]
+        init_values["position_weights"] = torch.zeros(num_pos, NUM_ERROR_TYPES, dtype=_logit_dtype)
     guide = AutoNormal(
         bayesian_context_error_model,
         init_loc_fn=init_to_value(values=init_values),
@@ -1425,7 +1566,7 @@ def train_bayesian_counts(
     losses = []
     for step in range(num_steps):
         loss = float(
-            svi.step(counts, init_logits, run_values, prior_scale, additive_context, context_indices)
+            svi.step(counts, init_logits, run_values, prior_scale, additive_context, context_indices, phred_context_sums, position_context_sums)
         )
         losses.append(loss)
         if progress_callback is not None:
@@ -1443,25 +1584,11 @@ def log_likelihood(
     run_values: torch.Tensor | None = None,
     additive_context: bool = False,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> float:
     """Return the conditional categorical log likelihood for counts."""
-    if additive_context:
-        logits = _compose_additive_context_logits(
-            params["intercept_logits"],
-            params["base_logits"],
-            counts.shape[0],
-            context_indices=context_indices,
-        )
-    else:
-        logits = params["logits"]
-    if run_values is not None:
-        run_steps = F.softplus(params["run_step_unconstrained"])
-        learned_run_values = torch.cat(
-            [torch.zeros(1, dtype=logits.dtype), torch.cumsum(run_steps, dim=0)]
-        )
-        run_shape = (1,) * (logits.dim() - 1) + (run_values.numel(), 1)
-        run_x = learned_run_values.reshape(run_shape)
-        logits = logits.unsqueeze(-2) + params["run_slopes"].unsqueeze(-2) * run_x
+    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums)
     log_probs = _masked_log_probs_for_counts(logits, counts)
     return float(_count_weighted_log_prob_sum(counts, log_probs).item())
 
@@ -1474,12 +1601,14 @@ def elbo_loss(
     additive_context: bool = False,
     prior_scale: float = 2.0,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> float:
     """Return joint negative log posterior at a parameter point."""
     if prior_scale <= 0:
         raise ValueError("prior_scale must be positive")
 
-    loss = -log_likelihood(counts, params, run_values, additive_context, context_indices)
+    loss = -log_likelihood(counts, params, run_values, additive_context, context_indices, phred_context_sums, position_context_sums)
     for value in params.values():
         loss -= float(
             dist.Normal(torch.zeros_like(value), prior_scale)
@@ -1496,6 +1625,8 @@ def _get_full_logits(
     run_values: torch.Tensor | None,
     additive_context: bool,
     context_indices: torch.Tensor | None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compose full logit tensor from fitted parameters."""
     if additive_context:
@@ -1507,6 +1638,13 @@ def _get_full_logits(
         )
     else:
         logits = params["logits"]
+    context_totals = counts.reshape(counts.shape[0], -1).sum(dim=-1, keepdim=True).clamp(min=1)
+    if phred_context_sums is not None and "phred_weights" in params:
+        mean_phred = phred_context_sums / context_totals
+        logits = logits + mean_phred @ params["phred_weights"]
+    if position_context_sums is not None and "position_weights" in params:
+        mean_pos = position_context_sums / context_totals
+        logits = logits + mean_pos @ params["position_weights"]
     return _compose_logits(
         logits,
         run_values,
@@ -1538,6 +1676,8 @@ def compute_marginal_error_rate(
     run_values: torch.Tensor | None = None,
     additive_context: bool = False,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> float:
     """Return model marginal error rate weighted by the empirical training distribution.
 
@@ -1547,11 +1687,13 @@ def compute_marginal_error_rate(
         run_values: Optional run-length values for homopolymer models.
         additive_context: Whether params use the additive parameterisation.
         context_indices: Subsampled context indices when counts rows are a subset.
+        phred_context_sums: Optional Phred sums tensor; shape [num_contexts, num_lags].
+        position_context_sums: Optional position sums tensor; shape [num_contexts, num_pos].
 
     Returns:
         Weighted-average probability of any error across all training contexts.
     """
-    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices)
+    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums)
     return _weighted_error_rate_with_offset(logits, counts, 0.0)
 
 
@@ -1562,6 +1704,8 @@ def calibrate_to_rate(
     run_values: torch.Tensor | None = None,
     additive_context: bool = False,
     context_indices: torch.Tensor | None = None,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
     tol: float = 1e-8,
     max_iter: int = 100,
 ) -> float:
@@ -1587,7 +1731,7 @@ def calibrate_to_rate(
     Raises:
         ValueError: If target_rate is outside the achievable range.
     """
-    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices)
+    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums)
 
     lo, hi = -50.0, 50.0
     rate_lo = _weighted_error_rate_with_offset(logits, counts, lo)
@@ -1618,16 +1762,18 @@ def num_free_parameters(
     scalar_run: bool = False,
     additive_context: bool = False,
     max_run: int = DEFAULT_MAX_RUN,
+    num_phred_lags: int = 0,
+    num_position_features: int = 0,
 ) -> int:
     """Return free categorical parameters after row-wise softmax invariance."""
     if additive_context:
         context_length = _context_length_from_shape(context_shape)
-        return (1 + (NUM_CONTEXT_BASES - 1) * context_length) * (
-            NUM_ERROR_TYPES - 1
-        )
-    multiplier = 2 if scalar_run else 1
-    transform_params = max_run if scalar_run else 0
-    return math.prod(context_shape) * multiplier * (NUM_ERROR_TYPES - 1) + transform_params
+        base = (1 + (NUM_CONTEXT_BASES - 1) * context_length) * (NUM_ERROR_TYPES - 1)
+    else:
+        multiplier = 2 if scalar_run else 1
+        transform_params = max_run if scalar_run else 0
+        base = math.prod(context_shape) * multiplier * (NUM_ERROR_TYPES - 1) + transform_params
+    return base + (num_phred_lags + num_position_features) * (NUM_ERROR_TYPES - 1)
 
 
 def aic(log_lik: float, num_parameters: int) -> float:
@@ -1675,6 +1821,8 @@ def compute_marginal_weibull(
     additive_context: bool = False,
     context_indices: torch.Tensor | None = None,
     calibration_offset: float = 0.0,
+    phred_context_sums: torch.Tensor | None = None,
+    position_context_sums: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Compute marginal Weibull parameters predicted by the model.
 
@@ -1703,7 +1851,7 @@ def compute_marginal_weibull(
         Dict with keys ``lambda``, ``beta``, ``window_averaged_rate``, and
         ``survival`` (list of S(1), …, S(v)).
     """
-    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices)
+    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums)
     calibrated = logits.clone()
     calibrated[..., 1:] += calibration_offset
 
@@ -1757,6 +1905,8 @@ def subsample_context_counts(
     new_total = int(trimmed.sum().item())
     context_totals = _context_totals(trimmed)
     new_low = int((context_totals < 10).sum().item())
+    trimmed_phred = counts_obj.phred_context_sums[keep_idx] if counts_obj.phred_context_sums is not None else None
+    trimmed_position = counts_obj.position_context_sums[keep_idx] if counts_obj.position_context_sums is not None else None
     logger.debug(
         "Subsampled context counts from %d to %d rows (%d → %d observations)",
         counts_obj.counts.shape[0],
@@ -1770,6 +1920,8 @@ def subsample_context_counts(
         total_observations=new_total,
         low_count_contexts=new_low,
         context_indices=keep_idx,
+        phred_context_sums=trimmed_phred,
+        position_context_sums=trimmed_position,
     )
 
 
@@ -1796,6 +1948,8 @@ def fit_and_test(
         additive_context=train_context_counts.additive_context,
         context_length=_cl,
         context_indices=train_context_counts.context_indices,
+        phred_context_sums=train_context_counts.phred_context_sums,
+        position_context_sums=train_context_counts.position_context_sums,
         lr=lr,
         num_steps=num_steps,
         clip_norm=clip_norm,
@@ -1809,6 +1963,8 @@ def fit_and_test(
         train_context_counts.run_values,
         train_context_counts.additive_context,
         context_indices=train_context_counts.context_indices,
+        phred_context_sums=train_context_counts.phred_context_sums,
+        position_context_sums=train_context_counts.position_context_sums,
     )
     test_ll = log_likelihood(
         test_context_counts.counts,
@@ -1816,7 +1972,11 @@ def fit_and_test(
         test_context_counts.run_values,
         test_context_counts.additive_context,
         context_indices=test_context_counts.context_indices,
+        phred_context_sums=test_context_counts.phred_context_sums,
+        position_context_sums=test_context_counts.position_context_sums,
     )
+    _n_phred = train_context_counts.phred_context_sums.shape[-1] if train_context_counts.phred_context_sums is not None else 0
+    _n_pos = train_context_counts.position_context_sums.shape[-1] if train_context_counts.position_context_sums is not None else 0
     k = num_free_parameters(
         train_context_counts.context_shape,
         scalar_run=train_context_counts.scalar_run,
@@ -1824,6 +1984,8 @@ def fit_and_test(
         max_run=train_context_counts.run_values.numel() - 1
         if train_context_counts.run_values is not None
         else DEFAULT_MAX_RUN,
+        num_phred_lags=_n_phred,
+        num_position_features=_n_pos,
     )
     return FitResult(
         params=params,
@@ -1859,6 +2021,8 @@ def fit_bayesian_and_test(
         additive_context=train_context_counts.additive_context,
         context_length=_cl,
         context_indices=train_context_counts.context_indices,
+        phred_context_sums=train_context_counts.phred_context_sums,
+        position_context_sums=train_context_counts.position_context_sums,
         lr=lr,
         num_steps=num_steps,
         clip_norm=clip_norm,
@@ -1873,6 +2037,8 @@ def fit_bayesian_and_test(
         train_context_counts.run_values,
         train_context_counts.additive_context,
         context_indices=train_context_counts.context_indices,
+        phred_context_sums=train_context_counts.phred_context_sums,
+        position_context_sums=train_context_counts.position_context_sums,
     )
     test_ll = log_likelihood(
         test_context_counts.counts,
@@ -1880,6 +2046,8 @@ def fit_bayesian_and_test(
         test_context_counts.run_values,
         test_context_counts.additive_context,
         context_indices=test_context_counts.context_indices,
+        phred_context_sums=test_context_counts.phred_context_sums,
+        position_context_sums=test_context_counts.position_context_sums,
     )
     return BayesianFitResult(
         params_mean=params_mean,
@@ -1895,6 +2063,8 @@ def fit_bayesian_and_test(
             additive_context=train_context_counts.additive_context,
             prior_scale=prior_scale,
             context_indices=train_context_counts.context_indices,
+            phred_context_sums=train_context_counts.phred_context_sums,
+            position_context_sums=train_context_counts.position_context_sums,
         ),
         test_elbo=-elbo_loss(
             test_context_counts.counts,
@@ -1903,6 +2073,8 @@ def fit_bayesian_and_test(
             additive_context=test_context_counts.additive_context,
             prior_scale=prior_scale,
             context_indices=test_context_counts.context_indices,
+            phred_context_sums=test_context_counts.phred_context_sums,
+            position_context_sums=test_context_counts.position_context_sums,
         ),
         prior_scale=prior_scale,
     )

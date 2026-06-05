@@ -468,18 +468,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "v": v,
         "synthetic": [
             _simulated_split_summary(
-                split=split,
+                split="train",
                 synthetic_results=synthetic_results,
                 source_model=args.source_model.resolve(),
                 retrained_model=args.retrained_model.resolve(),
                 v=v,
             )
-            for split in ("train", "test")
         ],
         "real_metagenome": [
             _real_split_summary(
-                split=split,
-                cache_path=real_cache_dir / f"{args.platform}_{split}_filtered_rows.h5",
+                split="train",
+                cache_path=real_cache_dir / f"{args.platform}_train_filtered_rows.h5",
                 real_model=args.real_model.resolve(),
                 existing_model=(
                     args.existing_real_model.resolve()
@@ -488,7 +487,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 v=v,
             )
-            for split in ("train", "test")
         ],
     }
     with open(output, "w") as handle:
