@@ -75,6 +75,7 @@ class ModelSpec:
     phred_lags: int = 0
     position_features: int = 0
     use_strand: bool = False
+    use_fragment_overdispersion: bool = False
 
     def __post_init__(self) -> None:
         if self.type not in MODEL_TYPES:
@@ -125,6 +126,7 @@ def load_model_config(path: Path) -> list[ModelSpec]:
             phred_lags=int(entry.get("phred_lags", 0)),
             position_features=int(entry.get("position_features", 0)),
             use_strand=bool(entry.get("use_strand", False)),
+            use_fragment_overdispersion=bool(entry.get("use_fragment_overdispersion", False)),
         )
         if spec.id in seen_ids:
             raise ValueError(f"{path}: duplicate model id {spec.id!r}")
@@ -171,13 +173,15 @@ def _counts_for_spec(
     phred_lags_override: int = 0,
     position_features_override: int = 0,
     strand_override: bool = False,
+    fragment_override: bool = False,
 ) -> ContextCounts:
-    """Return context counts with additive_context and phred/position/strand covariates set per spec.
+    """Return context counts with additive_context and phred/position/strand/fragment covariates set per spec.
 
     For additive_context models, optionally cap to the top-``max_contexts``
     most-observed context rows to bound training time. Phred and position sums are
     truncated to the effective lag/feature count (max of spec and override), or
     stripped when 0. Strand sums are stripped unless the spec or override enables them.
+    Fragment counts are stripped unless the spec or override enables fragment overdispersion.
     """
     base = screen_counts.by_length[spec.context_length]
     if base.additive_context != spec.additive_context:
@@ -203,6 +207,9 @@ def _counts_for_spec(
     effective_strand = spec.use_strand or strand_override
     if not effective_strand and base.strand_context_sums is not None:
         base = dataclasses.replace(base, strand_context_sums=None)
+    effective_frag = spec.use_fragment_overdispersion or fragment_override
+    if not effective_frag and base.fragment_count_per_context is not None:
+        base = dataclasses.replace(base, fragment_count_per_context=None)
     if spec.additive_context and max_contexts is not None:
         base = subsample_context_counts(base, max_contexts)
     return base
@@ -478,6 +485,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fragment-overdispersion",
+        action="store_true",
+        default=False,
+        help=(
+            "Model between-fragment overdispersion via Dirichlet-Multinomial likelihood. "
+            "Tracks unique fragment IDs per context during aggregation. "
+            "Requires a fragment_id column in TSV files (skiver dump output). "
+            "Global override: enables fragment overdispersion for all models."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -496,6 +514,7 @@ def _aggregate_with_progress(
     num_phred_lags: int = 0,
     num_position_features: int = 0,
     use_strand: bool = False,
+    use_fragment_overdispersion: bool = False,
 ) -> ContextLengthScreenCounts:
     """Aggregate all context-length counts while rendering a Rich progress bar."""
     state = {"scanned": 0, "accepted": 0, "skipped": 0}
@@ -547,6 +566,7 @@ def _aggregate_with_progress(
             num_phred_lags=num_phred_lags,
             num_position_features=num_position_features,
             use_strand=use_strand,
+            use_fragment_overdispersion=use_fragment_overdispersion,
         )
 
 
@@ -671,11 +691,12 @@ def _load_counts(
     num_phred_lags: int = 0,
     num_position_features: int = 0,
     use_strand: bool = False,
+    use_fragment_overdispersion: bool = False,
     args: argparse.Namespace,
 ) -> ContextLengthScreenCounts:
     """Load counts from HDF5 cache when possible, otherwise parse TSVs."""
-    # H5 cache does not store Phred, position, or strand scores; bypass when any is active.
-    use_cache = not args.no_cache and num_phred_lags == 0 and num_position_features == 0 and not use_strand
+    # H5 cache does not store Phred, position, strand, or fragment scores; bypass when any is active.
+    use_cache = not args.no_cache and num_phred_lags == 0 and num_position_features == 0 and not use_strand and not use_fragment_overdispersion
     if use_cache:
         h5_path = cache_path(args.cache_dir, platform, split, include_outliers)
         cached_counts = _aggregate_row_cache_with_progress(
@@ -708,10 +729,10 @@ def _load_counts(
             if cached_counts is not None:
                 return cached_counts
         logger.info("%s/%s HDF5 row cache unavailable; parsing TSV files", platform, split)
-    elif num_phred_lags > 0 or num_position_features > 0 or use_strand:
+    elif num_phred_lags > 0 or num_position_features > 0 or use_strand or use_fragment_overdispersion:
         logger.info(
-            "%s/%s phred_lags=%d position_features=%d use_strand=%s: bypassing H5 cache, parsing TSV files",
-            platform, split, num_phred_lags, num_position_features, use_strand,
+            "%s/%s phred_lags=%d position_features=%d use_strand=%s use_fragment_overdispersion=%s: bypassing H5 cache, parsing TSV files",
+            platform, split, num_phred_lags, num_position_features, use_strand, use_fragment_overdispersion,
         )
     else:
         logger.info("%s/%s cache disabled; parsing TSV files", platform, split)
@@ -725,8 +746,9 @@ def _load_counts(
         num_phred_lags=num_phred_lags,
         num_position_features=num_position_features,
         use_strand=use_strand,
+        use_fragment_overdispersion=use_fragment_overdispersion,
     )
-    if args.write_cache and num_phred_lags == 0:
+    if args.write_cache and num_phred_lags == 0 and not use_fragment_overdispersion:
         require_h5py()
         _row_cache_with_progress(
             platform=platform,
@@ -940,6 +962,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_strand_any = any(s.use_strand for s in model_specs) or args.strand_covariate
     if use_strand_any:
         logger.info("Strand covariate enabled")
+    use_fragment_any = any(s.use_fragment_overdispersion for s in model_specs) or args.fragment_overdispersion
+    if use_fragment_any:
+        logger.info("Fragment overdispersion enabled")
 
     platforms = tuple(args.platform) if args.platform else DEFAULT_PLATFORMS
     logger.info("Platforms: %s", ", ".join(platforms))
@@ -985,6 +1010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             num_phred_lags=max_phred_lags,
             num_position_features=max_position_features,
             use_strand=use_strand_any,
+            use_fragment_overdispersion=use_fragment_any,
             args=args,
         )
         logger.info(
@@ -1005,6 +1031,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 num_phred_lags=max_phred_lags,
                 num_position_features=max_position_features,
                 use_strand=use_strand_any,
+                use_fragment_overdispersion=use_fragment_any,
                 args=args,
             )
         logger.info(
@@ -1015,8 +1042,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         for spec in model_specs:
-            train_counts = _counts_for_spec(spec, train_platform_counts, max_contexts=args.max_contexts, phred_lags_override=args.phred_lags, position_features_override=args.position_features, strand_override=args.strand_covariate)
-            test_counts = _counts_for_spec(spec, test_platform_counts, phred_lags_override=args.phred_lags, position_features_override=args.position_features, strand_override=args.strand_covariate)
+            train_counts = _counts_for_spec(spec, train_platform_counts, max_contexts=args.max_contexts, phred_lags_override=args.phred_lags, position_features_override=args.position_features, strand_override=args.strand_covariate, fragment_override=args.fragment_overdispersion)
+            test_counts = _counts_for_spec(spec, test_platform_counts, phred_lags_override=args.phred_lags, position_features_override=args.position_features, strand_override=args.strand_covariate, fragment_override=args.fragment_overdispersion)
 
             mle_fit, vi_fit, n_train, n_test, low_count_contexts = _run_model(
                 platform=platform,

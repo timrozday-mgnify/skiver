@@ -329,6 +329,7 @@ pub unsafe fn extract_markers_avx2_masked(
                     dist_to_read_end: string.len() as u32 - (offsets[0] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
             if h2 < threshold_marker {
@@ -340,6 +341,7 @@ pub unsafe fn extract_markers_avx2_masked(
                     dist_to_read_end: string.len() as u32 - (offsets[1] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
             if h3 < threshold_marker {
@@ -351,6 +353,7 @@ pub unsafe fn extract_markers_avx2_masked(
                     dist_to_read_end: string.len() as u32 - (offsets[2] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
             if h4 < threshold_marker {
@@ -362,6 +365,7 @@ pub unsafe fn extract_markers_avx2_masked(
                     dist_to_read_end: string.len() as u32 - (offsets[3] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
 
@@ -391,6 +395,7 @@ pub unsafe fn extract_markers_avx2_masked(
                         dist_to_read_end: string.len() as u32 - (offsets[0] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
                 if hr2 < threshold_marker {
@@ -402,6 +407,7 @@ pub unsafe fn extract_markers_avx2_masked(
                         dist_to_read_end: string.len() as u32 - (offsets[1] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
                 if hr3 < threshold_marker {
@@ -413,6 +419,7 @@ pub unsafe fn extract_markers_avx2_masked(
                         dist_to_read_end: string.len() as u32 - (offsets[2] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
                 if hr4 < threshold_marker {
@@ -424,6 +431,7 @@ pub unsafe fn extract_markers_avx2_masked(
                         dist_to_read_end: string.len() as u32 - (offsets[3] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
             }
@@ -593,6 +601,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                     dist_to_read_end: string.len() as u32 - (offsets[0] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
             if h2 < threshold_marker {
@@ -604,6 +613,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                     dist_to_read_end: string.len() as u32 - (offsets[1] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
             if h3 < threshold_marker {
@@ -615,6 +625,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                     dist_to_read_end: string.len() as u32 - (offsets[2] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
             if h4 < threshold_marker {
@@ -626,6 +637,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                     dist_to_read_end: string.len() as u32 - (offsets[3] + i - v + 1) as u32,
                     is_forward: true,
                     read_id,
+                    fragment_id: 0,
                 });
             }
 
@@ -656,6 +668,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                         dist_to_read_end: string.len() as u32 - (offsets[0] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
                 if hr2 < threshold_marker {
@@ -667,6 +680,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                         dist_to_read_end: string.len() as u32 - (offsets[1] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
                 if hr3 < threshold_marker {
@@ -678,6 +692,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                         dist_to_read_end: string.len() as u32 - (offsets[2] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
                 if hr4 < threshold_marker {
@@ -689,6 +704,7 @@ pub unsafe fn extract_markers_avx2_masked_with_qual(
                         dist_to_read_end: string.len() as u32 - (offsets[3] + i - k + 1) as u32,
                         is_forward: false,
                         read_id,
+                        fragment_id: 0,
                     });
                 }
             }

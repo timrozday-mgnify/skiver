@@ -153,9 +153,10 @@ fn write_raw_row(
 
     writeln!(
         w,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         obs_id,
         info.read_id,
+        info.fragment_id,
         key_str,
         consensus_str,
         obs_value_str,
@@ -214,9 +215,10 @@ fn write_base_rows(
                 let ch = SEQ_TO_CHAR[b];
                 writeln!(
                     w,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     obs_id,
                     info.read_id,
+                    info.fragment_id,
                     t,
                     ch,
                     ch,
@@ -251,9 +253,10 @@ fn write_base_rows(
                     };
                     writeln!(
                         w,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         obs_id,
                         info.read_id,
+                        info.fragment_id,
                         t,
                         SEQ_TO_CHAR[true_b],
                         SEQ_TO_CHAR[obs_b],
@@ -307,9 +310,10 @@ fn write_base_rows(
                     };
                     writeln!(
                         w,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         obs_id,
                         info.read_id,
+                        info.fragment_id,
                         t,
                         true_ch,
                         obs_ch,
@@ -360,9 +364,10 @@ fn write_base_rows(
                     };
                     writeln!(
                         w,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         obs_id,
                         info.read_id,
+                        info.fragment_id,
                         t,
                         true_ch,
                         obs_ch,
@@ -413,9 +418,10 @@ fn write_survival_row(
 
     writeln!(
         w,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         obs_id,
         info.read_id,
+        info.fragment_id,
         key_str,
         first_error_t,
         censored,
@@ -610,7 +616,7 @@ pub fn dump(args: DumpArgs) {
     if let Some(ref mut w) = raw_writer {
         writeln!(
             w,
-            "obs_id\tread_id\tkey_str\tconsensus_str\tobs_value_str\tedit_distance\t\
+            "obs_id\tread_id\tfragment_id\tkey_str\tconsensus_str\tobs_value_str\tedit_distance\t\
              edit_op\tedit_position\tqual_str\tstart_index\tdist_to_read_end\t\
              is_forward\tpasses_filter"
         )
@@ -619,7 +625,7 @@ pub fn dump(args: DumpArgs) {
     if let Some(ref mut w) = base_writer {
         writeln!(
             w,
-            "obs_id\tread_id\tt\ttrue_base\tobs_base\tprev_base\tedit_op\tphred\tread_pos\t\
+            "obs_id\tread_id\tfragment_id\tt\ttrue_base\tobs_base\tprev_base\tedit_op\tphred\tread_pos\t\
              dist_to_end\tis_forward\tpasses_filter"
         )
         .unwrap();
@@ -627,7 +633,7 @@ pub fn dump(args: DumpArgs) {
     if let Some(ref mut w) = surv_writer {
         writeln!(
             w,
-            "obs_id\tread_id\tkey_str\tfirst_error_t\tcensored\tstart_index\t\
+            "obs_id\tread_id\tfragment_id\tkey_str\tfirst_error_t\tcensored\tstart_index\t\
              dist_to_read_end\tis_forward\tpasses_filter"
         )
         .unwrap();

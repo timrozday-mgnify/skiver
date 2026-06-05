@@ -162,6 +162,7 @@ pub fn fmh_seeds_masked(
                 dist_to_read_end: len as u32 - (i - v + 1) as u32,
                 is_forward: true,
                 read_id,
+                fragment_id: 0,
             });
         }
 
@@ -188,6 +189,7 @@ pub fn fmh_seeds_masked(
                     dist_to_read_end: len as u32 - (i - k + 1) as u32,
                     is_forward: false,
                     read_id,
+                    fragment_id: 0,
                 });
             }
         }
@@ -282,6 +284,7 @@ pub fn fmh_seeds_masked_with_qual(
                 dist_to_read_end: len as u32 - (i - v + 1) as u32,
                 is_forward: true,
                 read_id,
+                fragment_id: 0,
             });
         }
 
@@ -310,6 +313,7 @@ pub fn fmh_seeds_masked_with_qual(
                     dist_to_read_end: len as u32 - (i - k + 1) as u32,
                     is_forward: false,
                     read_id,
+                    fragment_id: 0,
                 });
             }
         }

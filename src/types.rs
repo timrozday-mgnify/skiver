@@ -44,6 +44,12 @@ pub struct ValueInfo {
     /// Sequential 0-based index of the source read within this sketching run.
     /// Observations sharing a `read_id` came from the same physical read.
     pub read_id: u64,
+    /// Hash of the DNA fragment name, stripped of pair suffixes (/1, /2).
+    /// For paired-end reads, both R1 and R2 of the same pair share the same
+    /// `fragment_id`. For unpaired reads, equals `read_id`. Defaults to 0
+    /// when loaded from old sketch files that predate this field.
+    #[serde(default)]
+    pub fragment_id: u64,
 }
 
 /**

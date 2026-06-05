@@ -59,6 +59,7 @@ class ContextCounts:
     phred_context_sums: torch.Tensor | None = None
     position_context_sums: torch.Tensor | None = None
     strand_context_sums: torch.Tensor | None = None
+    fragment_count_per_context: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -549,7 +550,8 @@ def _aggregate_one_prefix_screen(
     num_phred_lags: int = 0,
     num_position_features: int = 0,
     use_strand: bool = False,
-) -> tuple[dict[int, "torch.Tensor"], dict[int, int], dict[int, int], int, int, dict[int, "torch.Tensor"], dict[int, "torch.Tensor"], dict[int, "torch.Tensor"]] | None:
+    use_fragment_overdispersion: bool = False,
+) -> tuple[dict[int, "torch.Tensor"], dict[int, int], dict[int, int], int, int, dict[int, "torch.Tensor"], dict[int, "torch.Tensor"], dict[int, "torch.Tensor"], "dict[int, dict[int, set[int]]] | None"] | None:
     """Aggregate a single prefix into its own count tensors (process-pool worker).
 
     Returns ``None`` if the file is missing. The per-file count tensors are summed
@@ -585,6 +587,11 @@ def _aggregate_one_prefix_screen(
         )
         for model in models
     } if use_strand else {}
+    from collections import defaultdict
+    fragment_id_sets: dict[int, dict[int, set[int]]] | None = (
+        {model.context_length: defaultdict(set) for model in models}
+        if use_fragment_overdispersion else None
+    )
     file_totals, file_skipped_by_length, file_total, file_skipped = (
         _aggregate_context_length_screen_file(
             path,
@@ -596,12 +603,13 @@ def _aggregate_one_prefix_screen(
             num_position_features=num_position_features,
             strand_context_sums_by_length=strand_sums,
             use_strand=use_strand,
+            fragment_id_sets_by_length=fragment_id_sets,
             passes_filter_only=passes_filter_only,
             progress_callback=None,
             progress_interval=10_000,
         )
     )
-    return count_tensors, file_totals, file_skipped_by_length, file_total, file_skipped, phred_sums, position_sums, strand_sums
+    return count_tensors, file_totals, file_skipped_by_length, file_total, file_skipped, phred_sums, position_sums, strand_sums, fragment_id_sets
 
 
 def aggregate_context_length_screen_counts(
@@ -615,6 +623,7 @@ def aggregate_context_length_screen_counts(
     num_phred_lags: int = 0,
     num_position_features: int = 0,
     use_strand: bool = False,
+    use_fragment_overdispersion: bool = False,
 ) -> ContextLengthScreenCounts:
     """Aggregate previous-base context models in one pass over TSV files.
 
@@ -639,6 +648,9 @@ def aggregate_context_length_screen_counts(
             order: log1p(dist_to_end), log1p(read_pos).
         use_strand: If True, accumulate the forward-strand fraction per context as
             a scalar covariate (from the ``is_forward`` column).
+        use_fragment_overdispersion: If True, track unique fragment IDs per context
+            to populate ``fragment_count_per_context`` in each ``ContextCounts``.
+            Requires a ``fragment_id`` column in the TSV files.
 
     Returns:
         Counts keyed by context length.
@@ -669,6 +681,11 @@ def aggregate_context_length_screen_counts(
         model.context_length: torch.zeros(*model.context_shape, 1, dtype=torch.float32)
         for model in models
     } if use_strand else {}
+    from collections import defaultdict
+    fragment_id_sets_global: dict[int, dict[int, set[int]]] | None = (
+        {model.context_length: defaultdict(set) for model in models}
+        if use_fragment_overdispersion else None
+    )
     totals_by_length = {model.context_length: 0 for model in models}
     skipped_by_length = {model.context_length: 0 for model in models}
 
@@ -683,7 +700,7 @@ def aggregate_context_length_screen_counts(
         nonlocal total_observations, skipped_rows
         if result is None:
             return
-        file_tensors, file_totals, file_skipped_by_length, file_total, file_skipped, file_phred, file_position, file_strand = result
+        file_tensors, file_totals, file_skipped_by_length, file_total, file_skipped, file_phred, file_position, file_strand, file_frag_sets = result
         for length, tensor in file_tensors.items():
             count_tensors[length] += tensor
         for length, psums in file_phred.items():
@@ -692,6 +709,10 @@ def aggregate_context_length_screen_counts(
             position_sum_tensors[length] += possums
         for length, ssums in file_strand.items():
             strand_sum_tensors[length] += ssums
+        if file_frag_sets is not None and fragment_id_sets_global is not None:
+            for length, ctx_sets in file_frag_sets.items():
+                for ctx_idx, fids in ctx_sets.items():
+                    fragment_id_sets_global[length][ctx_idx].update(fids)
         for length, total in file_totals.items():
             totals_by_length[length] += total
         for length, skipped in file_skipped_by_length.items():
@@ -711,6 +732,7 @@ def aggregate_context_length_screen_counts(
                     num_phred_lags,
                     num_position_features,
                     use_strand,
+                    use_fragment_overdispersion,
                 ): prefix
                 for prefix in prefix_list
             }
@@ -736,6 +758,7 @@ def aggregate_context_length_screen_counts(
                     num_position_features=num_position_features,
                     strand_context_sums_by_length=strand_sum_tensors,
                     use_strand=use_strand,
+                    fragment_id_sets_by_length=fragment_id_sets_global,
                     passes_filter_only=passes_filter_only,
                     progress_callback=progress_callback,
                     progress_interval=progress_interval,
@@ -756,6 +779,14 @@ def aggregate_context_length_screen_counts(
         phred_sums = phred_sum_tensors.get(model.context_length)
         position_sums = position_sum_tensors.get(model.context_length)
         strand_sums = strand_sum_tensors.get(model.context_length)
+        fragment_counts: torch.Tensor | None = None
+        if fragment_id_sets_global is not None:
+            fid_sets = fragment_id_sets_global[model.context_length]
+            n_ctx = math.prod(model.context_shape)
+            fragment_counts = torch.tensor(
+                [len(fid_sets[i]) for i in range(n_ctx)],
+                dtype=torch.float32,
+            )
         by_length[model.context_length] = ContextCounts(
             counts=counts,
             run_values=None,
@@ -767,6 +798,7 @@ def aggregate_context_length_screen_counts(
             phred_context_sums=phred_sums,
             position_context_sums=position_sums,
             strand_context_sums=strand_sums,
+            fragment_count_per_context=fragment_counts,
         )
 
     return ContextLengthScreenCounts(
@@ -787,6 +819,7 @@ def _aggregate_context_length_screen_file(
     num_position_features: int = 0,
     strand_context_sums_by_length: dict[int, torch.Tensor],
     use_strand: bool = False,
+    fragment_id_sets_by_length: "dict[int, dict[int, set[int]]] | None" = None,
     passes_filter_only: bool,
     progress_callback: ProgressCallback | None,
     progress_interval: int,
@@ -842,6 +875,8 @@ def _aggregate_context_length_screen_file(
             required.update(["dist_to_end", "read_pos"])
         if use_strand:
             required.add("is_forward")
+        if fragment_id_sets_by_length is not None:
+            required.add("fragment_id")
         missing = required.difference(reader.fieldnames or [])
         if missing:
             raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
@@ -903,6 +938,10 @@ def _aggregate_context_length_screen_file(
                 if use_strand:
                     flat_ctx = context_idx[0]
                     strand_context_sums_by_length[model.context_length][flat_ctx, 0] += strand_val
+                if fragment_id_sets_by_length is not None:
+                    flat_ctx = context_idx[0]
+                    frag_id = int(row["fragment_id"])
+                    fragment_id_sets_by_length[model.context_length][flat_ctx].add(frag_id)
 
             total_observations += 1
             accepted_since_callback += 1
@@ -1160,6 +1199,7 @@ def context_error_model(
     phred_context_sums: torch.Tensor | None = None,
     position_context_sums: torch.Tensor | None = None,
     strand_context_sums: torch.Tensor | None = None,
+    fragment_count_per_context: torch.Tensor | None = None,
 ) -> None:
     """Pyro model for aggregated conditional categorical observations."""
     if additive_context:
@@ -1208,8 +1248,24 @@ def context_error_model(
         run_shape = (1,) * (logits.dim() - 1) + (run_values.numel(), 1)
         run_x = learned_run_values.reshape(run_shape)
         logits = logits.unsqueeze(-2) + run_slopes.unsqueeze(-2) * run_x
-    log_probs = _masked_log_probs_for_counts(logits, counts)
-    pyro.factor("error_type_log_likelihood", _count_weighted_log_prob_sum(counts, log_probs))
+    if fragment_count_per_context is not None:
+        log_phi = pyro.param("log_phi_unconstrained", torch.tensor(3.0, dtype=logits.dtype))
+        phi = F.softplus(log_phi)
+        counts_flat = counts.reshape(counts.shape[0], -1)
+        logits_flat = logits.reshape(counts.shape[0], -1)
+        probs_flat = torch.softmax(logits_flat, dim=-1)
+        frag = fragment_count_per_context.to(dtype=logits.dtype)
+        concentration = probs_flat * (phi * frag.unsqueeze(-1))
+        n_c = counts_flat.sum(dim=-1)
+        mask = n_c > 0
+        dm = torch.distributions.DirichletMultinomial(
+            total_count=n_c[mask], concentration=concentration[mask]
+        )
+        log_lik = dm.log_prob(counts_flat[mask]).sum()
+        pyro.factor("error_type_log_likelihood", log_lik)
+    else:
+        log_probs = _masked_log_probs_for_counts(logits, counts)
+        pyro.factor("error_type_log_likelihood", _count_weighted_log_prob_sum(counts, log_probs))
 
 
 def _compose_logits(
@@ -1342,6 +1398,7 @@ def bayesian_context_error_model(
     phred_context_sums: torch.Tensor | None = None,
     position_context_sums: torch.Tensor | None = None,
     strand_context_sums: torch.Tensor | None = None,
+    fragment_count_per_context: torch.Tensor | None = None,
 ) -> None:
     """Bayesian context error model with Normal priors over logit parameters."""
     if additive_context:
@@ -1423,8 +1480,27 @@ def bayesian_context_error_model(
         run_slopes,
         run_step_unconstrained,
     )
-    log_probs = _masked_log_probs_for_counts(final_logits, counts)
-    pyro.factor("error_type_log_likelihood", _count_weighted_log_prob_sum(counts, log_probs))
+    if fragment_count_per_context is not None:
+        log_phi = pyro.sample(
+            "log_phi_unconstrained",
+            dist.Normal(torch.tensor(3.0, dtype=final_logits.dtype), prior_scale),
+        )
+        phi = F.softplus(log_phi)
+        counts_flat = counts.reshape(counts.shape[0], -1)
+        logits_flat = final_logits.reshape(counts.shape[0], -1)
+        probs_flat = torch.softmax(logits_flat, dim=-1)
+        frag = fragment_count_per_context.to(dtype=final_logits.dtype)
+        concentration = probs_flat * (phi * frag.unsqueeze(-1))
+        n_c = counts_flat.sum(dim=-1)
+        mask = n_c > 0
+        dm = torch.distributions.DirichletMultinomial(
+            total_count=n_c[mask], concentration=concentration[mask]
+        )
+        log_lik = dm.log_prob(counts_flat[mask]).sum()
+        pyro.factor("error_type_log_likelihood", log_lik)
+    else:
+        log_probs = _masked_log_probs_for_counts(final_logits, counts)
+        pyro.factor("error_type_log_likelihood", _count_weighted_log_prob_sum(counts, log_probs))
 
 
 def empty_guide(
@@ -1436,9 +1512,10 @@ def empty_guide(
     phred_context_sums: torch.Tensor | None = None,
     position_context_sums: torch.Tensor | None = None,
     strand_context_sums: torch.Tensor | None = None,
+    fragment_count_per_context: torch.Tensor | None = None,
 ) -> None:
     """Empty guide for maximum-likelihood optimisation."""
-    del counts, init_logits, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums
+    del counts, init_logits, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums, fragment_count_per_context
 
 
 def initialise_logits(counts: torch.Tensor, *, pseudo_count: float = 0.5) -> torch.Tensor:
@@ -1458,6 +1535,7 @@ def train_counts(
     phred_context_sums: torch.Tensor | None = None,
     position_context_sums: torch.Tensor | None = None,
     strand_context_sums: torch.Tensor | None = None,
+    fragment_count_per_context: torch.Tensor | None = None,
     lr: float = 0.05,
     num_steps: int = 1000,
     clip_norm: float = 10.0,
@@ -1510,7 +1588,7 @@ def train_counts(
 
     losses = []
     for step in range(num_steps):
-        loss = float(svi.step(counts, init_logits, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums))
+        loss = float(svi.step(counts, init_logits, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums, fragment_count_per_context))
         losses.append(loss)
         if progress_callback is not None:
             progress_callback(step, loss)
@@ -1555,6 +1633,7 @@ def train_bayesian_counts(
     phred_context_sums: torch.Tensor | None = None,
     position_context_sums: torch.Tensor | None = None,
     strand_context_sums: torch.Tensor | None = None,
+    fragment_count_per_context: torch.Tensor | None = None,
     lr: float = 0.01,
     num_steps: int = 1000,
     clip_norm: float = 10.0,
@@ -1606,6 +1685,8 @@ def train_bayesian_counts(
         init_values["position_weights"] = torch.zeros(num_pos, NUM_ERROR_TYPES, dtype=_logit_dtype)
     if strand_context_sums is not None:
         init_values["strand_weights"] = torch.zeros(1, NUM_ERROR_TYPES, dtype=_logit_dtype)
+    if fragment_count_per_context is not None:
+        init_values["log_phi_unconstrained"] = torch.tensor(3.0, dtype=_logit_dtype)
     guide = AutoNormal(
         bayesian_context_error_model,
         init_loc_fn=init_to_value(values=init_values),
@@ -1621,7 +1702,7 @@ def train_bayesian_counts(
     losses = []
     for step in range(num_steps):
         loss = float(
-            svi.step(counts, init_logits, run_values, prior_scale, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums)
+            svi.step(counts, init_logits, run_values, prior_scale, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums, fragment_count_per_context)
         )
         losses.append(loss)
         if progress_callback is not None:
@@ -1642,9 +1723,23 @@ def log_likelihood(
     phred_context_sums: torch.Tensor | None = None,
     position_context_sums: torch.Tensor | None = None,
     strand_context_sums: torch.Tensor | None = None,
+    fragment_count_per_context: torch.Tensor | None = None,
 ) -> float:
     """Return the conditional categorical log likelihood for counts."""
     logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums)
+    if fragment_count_per_context is not None and "log_phi_unconstrained" in params:
+        phi = F.softplus(params["log_phi_unconstrained"])
+        counts_flat = counts.reshape(counts.shape[0], -1)
+        logits_flat = logits.reshape(counts.shape[0], -1)
+        probs_flat = torch.softmax(logits_flat, dim=-1)
+        frag = fragment_count_per_context.to(dtype=logits.dtype)
+        concentration = probs_flat * (phi * frag.unsqueeze(-1))
+        n_c = counts_flat.sum(dim=-1)
+        mask = n_c > 0
+        dm = torch.distributions.DirichletMultinomial(
+            total_count=n_c[mask], concentration=concentration[mask]
+        )
+        return float(dm.log_prob(counts_flat[mask]).sum().item())
     log_probs = _masked_log_probs_for_counts(logits, counts)
     return float(_count_weighted_log_prob_sum(counts, log_probs).item())
 
@@ -1660,12 +1755,13 @@ def elbo_loss(
     phred_context_sums: torch.Tensor | None = None,
     position_context_sums: torch.Tensor | None = None,
     strand_context_sums: torch.Tensor | None = None,
+    fragment_count_per_context: torch.Tensor | None = None,
 ) -> float:
     """Return joint negative log posterior at a parameter point."""
     if prior_scale <= 0:
         raise ValueError("prior_scale must be positive")
 
-    loss = -log_likelihood(counts, params, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums)
+    loss = -log_likelihood(counts, params, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums, fragment_count_per_context)
     for value in params.values():
         loss -= float(
             dist.Normal(torch.zeros_like(value), prior_scale)
@@ -1829,6 +1925,7 @@ def num_free_parameters(
     num_phred_lags: int = 0,
     num_position_features: int = 0,
     use_strand: bool = False,
+    use_fragment_overdispersion: bool = False,
 ) -> int:
     """Return free categorical parameters after row-wise softmax invariance."""
     if additive_context:
@@ -1838,7 +1935,7 @@ def num_free_parameters(
         multiplier = 2 if scalar_run else 1
         transform_params = max_run if scalar_run else 0
         base = math.prod(context_shape) * multiplier * (NUM_ERROR_TYPES - 1) + transform_params
-    return base + (num_phred_lags + num_position_features + int(use_strand)) * (NUM_ERROR_TYPES - 1)
+    return base + (num_phred_lags + num_position_features + int(use_strand)) * (NUM_ERROR_TYPES - 1) + int(use_fragment_overdispersion)
 
 
 def aic(log_lik: float, num_parameters: int) -> float:
@@ -1974,6 +2071,7 @@ def subsample_context_counts(
     trimmed_phred = counts_obj.phred_context_sums[keep_idx] if counts_obj.phred_context_sums is not None else None
     trimmed_position = counts_obj.position_context_sums[keep_idx] if counts_obj.position_context_sums is not None else None
     trimmed_strand = counts_obj.strand_context_sums[keep_idx] if counts_obj.strand_context_sums is not None else None
+    trimmed_frag = counts_obj.fragment_count_per_context[keep_idx] if counts_obj.fragment_count_per_context is not None else None
     logger.debug(
         "Subsampled context counts from %d to %d rows (%d → %d observations)",
         counts_obj.counts.shape[0],
@@ -1990,6 +2088,7 @@ def subsample_context_counts(
         phred_context_sums=trimmed_phred,
         position_context_sums=trimmed_position,
         strand_context_sums=trimmed_strand,
+        fragment_count_per_context=trimmed_frag,
     )
 
 
@@ -2019,6 +2118,7 @@ def fit_and_test(
         phred_context_sums=train_context_counts.phred_context_sums,
         position_context_sums=train_context_counts.position_context_sums,
         strand_context_sums=train_context_counts.strand_context_sums,
+        fragment_count_per_context=train_context_counts.fragment_count_per_context,
         lr=lr,
         num_steps=num_steps,
         clip_norm=clip_norm,
@@ -2035,6 +2135,7 @@ def fit_and_test(
         phred_context_sums=train_context_counts.phred_context_sums,
         position_context_sums=train_context_counts.position_context_sums,
         strand_context_sums=train_context_counts.strand_context_sums,
+        fragment_count_per_context=train_context_counts.fragment_count_per_context,
     )
     test_ll = log_likelihood(
         test_context_counts.counts,
@@ -2045,10 +2146,12 @@ def fit_and_test(
         phred_context_sums=test_context_counts.phred_context_sums,
         position_context_sums=test_context_counts.position_context_sums,
         strand_context_sums=test_context_counts.strand_context_sums,
+        fragment_count_per_context=test_context_counts.fragment_count_per_context,
     )
     _n_phred = train_context_counts.phred_context_sums.shape[-1] if train_context_counts.phred_context_sums is not None else 0
     _n_pos = train_context_counts.position_context_sums.shape[-1] if train_context_counts.position_context_sums is not None else 0
     _use_strand = train_context_counts.strand_context_sums is not None
+    _use_frag = train_context_counts.fragment_count_per_context is not None
     k = num_free_parameters(
         train_context_counts.context_shape,
         scalar_run=train_context_counts.scalar_run,
@@ -2059,6 +2162,7 @@ def fit_and_test(
         num_phred_lags=_n_phred,
         num_position_features=_n_pos,
         use_strand=_use_strand,
+        use_fragment_overdispersion=_use_frag,
     )
     return FitResult(
         params=params,
@@ -2097,6 +2201,7 @@ def fit_bayesian_and_test(
         phred_context_sums=train_context_counts.phred_context_sums,
         position_context_sums=train_context_counts.position_context_sums,
         strand_context_sums=train_context_counts.strand_context_sums,
+        fragment_count_per_context=train_context_counts.fragment_count_per_context,
         lr=lr,
         num_steps=num_steps,
         clip_norm=clip_norm,
@@ -2114,6 +2219,7 @@ def fit_bayesian_and_test(
         phred_context_sums=train_context_counts.phred_context_sums,
         position_context_sums=train_context_counts.position_context_sums,
         strand_context_sums=train_context_counts.strand_context_sums,
+        fragment_count_per_context=train_context_counts.fragment_count_per_context,
     )
     test_ll = log_likelihood(
         test_context_counts.counts,
@@ -2124,6 +2230,7 @@ def fit_bayesian_and_test(
         phred_context_sums=test_context_counts.phred_context_sums,
         position_context_sums=test_context_counts.position_context_sums,
         strand_context_sums=test_context_counts.strand_context_sums,
+        fragment_count_per_context=test_context_counts.fragment_count_per_context,
     )
     return BayesianFitResult(
         params_mean=params_mean,
@@ -2142,6 +2249,7 @@ def fit_bayesian_and_test(
             phred_context_sums=train_context_counts.phred_context_sums,
             position_context_sums=train_context_counts.position_context_sums,
             strand_context_sums=train_context_counts.strand_context_sums,
+            fragment_count_per_context=train_context_counts.fragment_count_per_context,
         ),
         test_elbo=-elbo_loss(
             test_context_counts.counts,
@@ -2153,6 +2261,7 @@ def fit_bayesian_and_test(
             phred_context_sums=test_context_counts.phred_context_sums,
             position_context_sums=test_context_counts.position_context_sums,
             strand_context_sums=test_context_counts.strand_context_sums,
+            fragment_count_per_context=test_context_counts.fragment_count_per_context,
         ),
         prior_scale=prior_scale,
     )

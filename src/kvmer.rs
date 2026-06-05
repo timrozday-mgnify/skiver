@@ -49,6 +49,38 @@ pub struct KVmerSet {
     read_id_counter: u64,
 }
 
+// ─── Fragment ID helpers ──────────────────────────────────────────────────────
+
+/// Compute a stable fragment ID from a read name by stripping known pair
+/// suffixes and hashing the base name with FNV-1a.
+///
+/// For paired-end FASTQ reads named `read1/1` and `read1/2`, both produce the
+/// same fragment ID. For BAM records the QNAME is identical for both ends of a
+/// pair, so passing `record.qname()` directly yields the correct shared ID.
+pub fn fragment_id_from_name(name: &[u8]) -> u64 {
+    // Strip /1 or /2 suffix
+    let base = if name.ends_with(b"/1") || name.ends_with(b"/2") {
+        &name[..name.len() - 2]
+    } else {
+        name
+    };
+    // FNV-1a 64-bit hash
+    let mut h: u64 = 14695981039346656037u64;
+    for &b in base {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211u64);
+    }
+    h
+}
+
+/// Set `fragment_id` on all entries in `info_vec` to `fid`.
+#[inline]
+fn set_fragment_ids(info_vec: &mut Vec<ValueInfo>, fid: u64) {
+    for info in info_vec.iter_mut() {
+        info.fragment_id = fid;
+    }
+}
+
 // ─── Shared seeding helpers ────────────────────────────────────────────────────
 
 /// Extract (key, value, ValueInfo) triples from a sequence with quality scores.
@@ -726,11 +758,13 @@ pub fn stream_file_observations<F>(
                         Ok(record) => {
                             let read_id = *read_id_counter;
                             *read_id_counter += 1;
+                            let fid = fragment_id_from_name(record.qname());
                             let seq = record.seq().as_bytes();
                             let qual = record.qual().to_vec();
-                            let (key_vec, value_vec, info_vec) = extract_kv_with_qual(
+                            let (key_vec, value_vec, mut info_vec) = extract_kv_with_qual(
                                 &seq, &qual, k, v, bidirectional, c, trim_front, trim_back, read_id,
                             );
+                            set_fragment_ids(&mut info_vec, fid);
                             for ((key, obs_value), info) in
                                 key_vec.iter().zip(value_vec.iter()).zip(info_vec.iter())
                             {
@@ -760,14 +794,16 @@ pub fn stream_file_observations<F>(
                 Ok(record) => {
                     let read_id = *read_id_counter;
                     *read_id_counter += 1;
+                    let fid = fragment_id_from_name(record.id());
                     let seq = record.seq();
-                    let (key_vec, value_vec, info_vec) = if let Some(qual) = record.qual() {
+                    let (key_vec, value_vec, mut info_vec) = if let Some(qual) = record.qual() {
                         extract_kv_with_qual(
                             &seq, qual, k, v, bidirectional, c, trim_front, trim_back, read_id,
                         )
                     } else {
                         extract_kv_no_qual(&seq, k, v, bidirectional, c, trim_front, trim_back, read_id)
                     };
+                    set_fragment_ids(&mut info_vec, fid);
                     for ((key, obs_value), info) in
                         key_vec.iter().zip(value_vec.iter()).zip(info_vec.iter())
                     {
@@ -1019,6 +1055,7 @@ impl KVmerSet {
                             Ok(record) => {
                                 let read_id = self.read_id_counter;
                                 self.read_id_counter += 1;
+                                let fid = fragment_id_from_name(record.qname());
                                 let seq = record.seq().as_bytes();
                                 let qual = record.qual().to_vec();
                                 let mut key_vec: Vec<u64> = Vec::new();
@@ -1035,6 +1072,7 @@ impl KVmerSet {
                                     trim_back,
                                     read_id,
                                 );
+                                set_fragment_ids(&mut info_vec, fid);
                                 self.add_kv_qual_vector_internal(
                                     &key_vec,
                                     &value_vec,
@@ -1066,6 +1104,7 @@ impl KVmerSet {
                     Ok(record) => {
                         let read_id = self.read_id_counter;
                         self.read_id_counter += 1;
+                        let fid = fragment_id_from_name(record.id());
                         let mut key_vec: Vec<u64> = Vec::new();
                         let mut value_vec: Vec<u64> = Vec::new();
                         if let Some(qual) = record.qual() {
@@ -1082,6 +1121,7 @@ impl KVmerSet {
                                 trim_back,
                                 read_id,
                             );
+                            set_fragment_ids(&mut info_vec, fid);
                             self.add_kv_qual_vector_internal(
                                 &key_vec,
                                 &value_vec,
@@ -1101,6 +1141,7 @@ impl KVmerSet {
                                 &mut info_vec,
                                 read_id,
                             );
+                            set_fragment_ids(&mut info_vec, fid);
                             self.add_kv_qual_vector_internal(
                                 &key_vec,
                                 &value_vec,
