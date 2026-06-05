@@ -63,6 +63,192 @@ class ContextCounts:
 
 
 @dataclass(frozen=True)
+class ModelComponents:
+    """Parsed representation of a composable model component string.
+
+    Build by calling ``parse_model_components(s)`` rather than directly.
+
+    Attributes:
+        context_length: Number of preceding consensus bases to condition on.
+        additive_context: ``True`` → AdditiveContext (factored, O(N) params);
+            ``False`` → BaseContext (full joint, 4^N params).
+        use_homopolymer: Include a learned scalar run-length slope per context.
+            Not yet supported in ``aggregate_context_length_screen_counts``.
+        num_phred_lags: Number of preceding Phred quality score covariates (≥0).
+        num_position_features: Number of read-position covariates (0, 1, or 2).
+            Features in order: log1p(dist_to_end), log1p(read_pos).
+        use_strand: Include the per-context forward-strand fraction as a covariate.
+        use_fragment_overdispersion: Replace Multinomial with Dirichlet-Multinomial
+            to model between-fragment overdispersion (adds one scalar φ parameter).
+    """
+
+    context_length: int
+    additive_context: bool
+    use_homopolymer: bool = False
+    num_phred_lags: int = 0
+    num_position_features: int = 0
+    use_strand: bool = False
+    use_fragment_overdispersion: bool = False
+
+
+def parse_model_components(s: str) -> ModelComponents:
+    """Parse a composable model component string into a ``ModelComponents``.
+
+    Component tokens are joined by ``+``.  Parameterised tokens use ``Name(N)``
+    syntax.  Exactly one context component (``BaseContext`` or
+    ``AdditiveContext``) is required; all other components are optional.
+
+    Available components:
+
+    ``BaseContext(N)``
+        Full joint (combinatorial) error-spectrum table over the N preceding
+        consensus bases.  Uses 4^N parameter rows; best for N ≤ 4.
+
+    ``AdditiveContext(N)``
+        Factored additive parameterisation: each position contributes
+        independently to log-odds.  O(N) parameters; preferred for N ≥ 5.
+
+    ``Homopolymer``
+        Learned scalar slope + monotone run-length transform per context;
+        captures increased indel rates in long homopolymer runs.
+        Not yet supported in ``aggregate_context_length_screen_counts``.
+
+    ``PhredContext(N)``
+        N preceding Phred quality scores as additive covariates; models
+        calibration of sequencer-reported quality.  Adds N×(E−1) parameters.
+
+    ``Position(N)``
+        N read-position features as additive covariates: log1p(dist_to_end),
+        log1p(read_pos).  N must be 1 or 2.  Captures 3′-end degradation and
+        5′ effects.  Adds N×(E−1) parameters.
+
+    ``Strand``
+        Forward-strand fraction per context as a scalar additive covariate.
+        Captures strand-asymmetric chemistry (e.g. C→T deamination).
+        Adds E−1 parameters.
+
+    ``FragmentOverdispersion``
+        Replaces Multinomial with Dirichlet-Multinomial.  Models
+        between-fragment variability in error rate; adds one scalar φ.
+        φ→∞ recovers Multinomial.
+
+    Args:
+        s: Component string, e.g.
+            ``"AdditiveContext(6)+PhredContext(3)+Position(2)+Strand"``.
+
+    Returns:
+        Validated ``ModelComponents``.
+
+    Raises:
+        ValueError: For unknown components, invalid arguments, or missing /
+            duplicate context components.
+
+    Examples:
+        >>> parse_model_components("BaseContext(1)")
+        ModelComponents(context_length=1, additive_context=False, ...)
+        >>> parse_model_components("AdditiveContext(6)+Strand+FragmentOverdispersion")
+        ModelComponents(context_length=6, additive_context=True, ..., use_strand=True, ...)
+    """
+    import re
+
+    context_length: int | None = None
+    additive_context: bool | None = None
+    use_homopolymer = False
+    num_phred_lags = 0
+    num_position_features = 0
+    use_strand = False
+    use_fragment_overdispersion = False
+
+    _PARAM_RE = re.compile(r"^(\w+)\((\d+)\)$")
+    _NAME_RE = re.compile(r"^(\w+)$")
+
+    for token in s.split("+"):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"Empty component in model string: {s!r}")
+
+        m_param = _PARAM_RE.match(token)
+        m_name = _NAME_RE.match(token)
+
+        if m_param:
+            name, arg_s = m_param.group(1), m_param.group(2)
+            arg = int(arg_s)
+        elif m_name:
+            name = m_name.group(1)
+            arg = None
+        else:
+            raise ValueError(f"Cannot parse component {token!r} in {s!r}")
+
+        if name == "BaseContext":
+            if arg is None or arg < 1:
+                raise ValueError(f"BaseContext requires N≥1, got {token!r}")
+            if context_length is not None:
+                raise ValueError(
+                    f"Model string {s!r} specifies more than one context component"
+                )
+            context_length = arg
+            additive_context = False
+
+        elif name == "AdditiveContext":
+            if arg is None or arg < 1:
+                raise ValueError(f"AdditiveContext requires N≥1, got {token!r}")
+            if context_length is not None:
+                raise ValueError(
+                    f"Model string {s!r} specifies more than one context component"
+                )
+            context_length = arg
+            additive_context = True
+
+        elif name == "Homopolymer":
+            if arg is not None:
+                raise ValueError(f"Homopolymer takes no argument, got {token!r}")
+            use_homopolymer = True
+
+        elif name == "PhredContext":
+            if arg is None or arg < 1:
+                raise ValueError(f"PhredContext requires N≥1, got {token!r}")
+            num_phred_lags = arg
+
+        elif name == "Position":
+            if arg is None or arg not in (1, 2):
+                raise ValueError(f"Position requires N∈{{1,2}}, got {token!r}")
+            num_position_features = arg
+
+        elif name == "Strand":
+            if arg is not None:
+                raise ValueError(f"Strand takes no argument, got {token!r}")
+            use_strand = True
+
+        elif name == "FragmentOverdispersion":
+            if arg is not None:
+                raise ValueError(f"FragmentOverdispersion takes no argument, got {token!r}")
+            use_fragment_overdispersion = True
+
+        else:
+            raise ValueError(
+                f"Unknown component {name!r} in {s!r}. "
+                "Valid components: BaseContext(N), AdditiveContext(N), Homopolymer, "
+                "PhredContext(N), Position(N), Strand, FragmentOverdispersion."
+            )
+
+    if context_length is None or additive_context is None:
+        raise ValueError(
+            f"Model string {s!r} must include exactly one of BaseContext(N) or "
+            "AdditiveContext(N)."
+        )
+
+    return ModelComponents(
+        context_length=context_length,
+        additive_context=additive_context,
+        use_homopolymer=use_homopolymer,
+        num_phred_lags=num_phred_lags,
+        num_position_features=num_position_features,
+        use_strand=use_strand,
+        use_fragment_overdispersion=use_fragment_overdispersion,
+    )
+
+
+@dataclass(frozen=True)
 class FitResult:
     """Fitted model parameters and evaluation metrics."""
 
@@ -1714,25 +1900,24 @@ def train_bayesian_counts(
     return params_mean, params_stdev, inference_params, losses
 
 
-def log_likelihood(
-    counts: torch.Tensor,
-    params: dict[str, torch.Tensor],
-    run_values: torch.Tensor | None = None,
-    additive_context: bool = False,
-    context_indices: torch.Tensor | None = None,
-    phred_context_sums: torch.Tensor | None = None,
-    position_context_sums: torch.Tensor | None = None,
-    strand_context_sums: torch.Tensor | None = None,
-    fragment_count_per_context: torch.Tensor | None = None,
-) -> float:
-    """Return the conditional categorical log likelihood for counts."""
-    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums)
-    if fragment_count_per_context is not None and "log_phi_unconstrained" in params:
+def log_likelihood(cc: ContextCounts, params: dict[str, torch.Tensor]) -> float:
+    """Return the conditional categorical log likelihood for counts.
+
+    Args:
+        cc: Aggregated context counts (produced by ``aggregate_*`` functions).
+        params: Fitted parameter dict (from ``train_counts`` or posterior mean).
+
+    Returns:
+        Total log likelihood as a Python float.
+    """
+    logits = _get_full_logits(cc, params)
+    counts = cc.counts
+    if cc.fragment_count_per_context is not None and "log_phi_unconstrained" in params:
         phi = F.softplus(params["log_phi_unconstrained"])
         counts_flat = counts.reshape(counts.shape[0], -1)
         logits_flat = logits.reshape(counts.shape[0], -1)
         probs_flat = torch.softmax(logits_flat, dim=-1)
-        frag = fragment_count_per_context.to(dtype=logits.dtype)
+        frag = cc.fragment_count_per_context.to(dtype=logits.dtype)
         concentration = probs_flat * (phi * frag.unsqueeze(-1))
         n_c = counts_flat.sum(dim=-1)
         mask = n_c > 0
@@ -1745,23 +1930,25 @@ def log_likelihood(
 
 
 def elbo_loss(
-    counts: torch.Tensor,
+    cc: ContextCounts,
     params: dict[str, torch.Tensor],
     *,
-    run_values: torch.Tensor | None = None,
-    additive_context: bool = False,
     prior_scale: float = 2.0,
-    context_indices: torch.Tensor | None = None,
-    phred_context_sums: torch.Tensor | None = None,
-    position_context_sums: torch.Tensor | None = None,
-    strand_context_sums: torch.Tensor | None = None,
-    fragment_count_per_context: torch.Tensor | None = None,
 ) -> float:
-    """Return joint negative log posterior at a parameter point."""
+    """Return joint negative log posterior (−ELBO proxy) at a parameter point.
+
+    Args:
+        cc: Aggregated context counts.
+        params: Parameter dict (MLE or posterior mean).
+        prior_scale: Standard deviation of Normal priors on all parameters.
+
+    Returns:
+        Scalar loss = −log_likelihood − Σ log_prior.
+    """
     if prior_scale <= 0:
         raise ValueError("prior_scale must be positive")
 
-    loss = -log_likelihood(counts, params, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums, fragment_count_per_context)
+    loss = -log_likelihood(cc, params)
     for value in params.values():
         loss -= float(
             dist.Normal(torch.zeros_like(value), prior_scale)
@@ -1773,38 +1960,33 @@ def elbo_loss(
 
 
 def _get_full_logits(
+    cc: ContextCounts,
     params: dict[str, torch.Tensor],
-    counts: torch.Tensor,
-    run_values: torch.Tensor | None,
-    additive_context: bool,
-    context_indices: torch.Tensor | None,
-    phred_context_sums: torch.Tensor | None = None,
-    position_context_sums: torch.Tensor | None = None,
-    strand_context_sums: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compose full logit tensor from fitted parameters."""
-    if additive_context:
+    """Compose full logit tensor from fitted parameters and context counts."""
+    counts = cc.counts
+    if cc.additive_context:
         logits = _compose_additive_context_logits(
             params["intercept_logits"],
             params["base_logits"],
             counts.shape[0],
-            context_indices=context_indices,
+            context_indices=cc.context_indices,
         )
     else:
         logits = params["logits"]
     context_totals = counts.reshape(counts.shape[0], -1).sum(dim=-1, keepdim=True).clamp(min=1)
-    if phred_context_sums is not None and "phred_weights" in params:
-        mean_phred = phred_context_sums / context_totals
+    if cc.phred_context_sums is not None and "phred_weights" in params:
+        mean_phred = cc.phred_context_sums / context_totals
         logits = logits + mean_phred @ params["phred_weights"]
-    if position_context_sums is not None and "position_weights" in params:
-        mean_pos = position_context_sums / context_totals
+    if cc.position_context_sums is not None and "position_weights" in params:
+        mean_pos = cc.position_context_sums / context_totals
         logits = logits + mean_pos @ params["position_weights"]
-    if strand_context_sums is not None and "strand_weights" in params:
-        mean_strand = strand_context_sums / context_totals
+    if cc.strand_context_sums is not None and "strand_weights" in params:
+        mean_strand = cc.strand_context_sums / context_totals
         logits = logits + mean_strand @ params["strand_weights"]
     return _compose_logits(
         logits,
-        run_values,
+        cc.run_values,
         params.get("run_slopes"),
         params.get("run_step_unconstrained"),
     )
@@ -1828,44 +2010,27 @@ def _weighted_error_rate_with_offset(
 
 
 def compute_marginal_error_rate(
-    counts: torch.Tensor,
+    cc: ContextCounts,
     params: dict[str, torch.Tensor],
-    run_values: torch.Tensor | None = None,
-    additive_context: bool = False,
-    context_indices: torch.Tensor | None = None,
-    phred_context_sums: torch.Tensor | None = None,
-    position_context_sums: torch.Tensor | None = None,
-    strand_context_sums: torch.Tensor | None = None,
 ) -> float:
     """Return model marginal error rate weighted by the empirical training distribution.
 
     Args:
-        counts: Context-by-target count tensor from aggregation.
+        cc: Aggregated context counts.
         params: Fitted parameter dict (MLE or VI posterior mean).
-        run_values: Optional run-length values for homopolymer models.
-        additive_context: Whether params use the additive parameterisation.
-        context_indices: Subsampled context indices when counts rows are a subset.
-        phred_context_sums: Optional Phred sums tensor; shape [num_contexts, num_lags].
-        position_context_sums: Optional position sums tensor; shape [num_contexts, num_pos].
-        strand_context_sums: Optional strand sums tensor; shape [num_contexts, 1].
 
     Returns:
         Weighted-average probability of any error across all training contexts.
     """
-    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums)
-    return _weighted_error_rate_with_offset(logits, counts, 0.0)
+    logits = _get_full_logits(cc, params)
+    return _weighted_error_rate_with_offset(logits, cc.counts, 0.0)
 
 
 def calibrate_to_rate(
-    counts: torch.Tensor,
+    cc: ContextCounts,
     params: dict[str, torch.Tensor],
     target_rate: float,
-    run_values: torch.Tensor | None = None,
-    additive_context: bool = False,
-    context_indices: torch.Tensor | None = None,
-    phred_context_sums: torch.Tensor | None = None,
-    position_context_sums: torch.Tensor | None = None,
-    strand_context_sums: torch.Tensor | None = None,
+    *,
     tol: float = 1e-8,
     max_iter: int = 100,
 ) -> float:
@@ -1876,12 +2041,9 @@ def calibrate_to_rate(
     context-conditional structure and error-type ratios are preserved.
 
     Args:
-        counts: Context-by-target count tensor from aggregation.
+        cc: Aggregated context counts.
         params: Fitted parameter dict (MLE or VI posterior mean).
         target_rate: Desired marginal error rate (e.g. Weibull estimate).
-        run_values: Optional run-length values for homopolymer models.
-        additive_context: Whether params use the additive parameterisation.
-        context_indices: Subsampled context indices when counts rows are a subset.
         tol: Convergence tolerance on error rate.
         max_iter: Maximum bisection iterations.
 
@@ -1891,7 +2053,8 @@ def calibrate_to_rate(
     Raises:
         ValueError: If target_rate is outside the achievable range.
     """
-    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums)
+    logits = _get_full_logits(cc, params)
+    counts = cc.counts
 
     lo, hi = -50.0, 50.0
     rate_lo = _weighted_error_rate_with_offset(logits, counts, lo)
@@ -1976,45 +2139,31 @@ def _fit_weibull_to_survival(
 
 
 def compute_marginal_weibull(
-    counts: torch.Tensor,
+    cc: ContextCounts,
     params: dict[str, torch.Tensor],
     v: int,
-    run_values: torch.Tensor | None = None,
-    additive_context: bool = False,
-    context_indices: torch.Tensor | None = None,
+    *,
     calibration_offset: float = 0.0,
-    phred_context_sums: torch.Tensor | None = None,
-    position_context_sums: torch.Tensor | None = None,
-    strand_context_sums: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Compute marginal Weibull parameters predicted by the model.
 
     Uses a mixture-of-geometrics approximation: each context c contributes a
     geometric first-error-time distribution with rate (1 − p_match_c), weighted
-    by the empirical context frequency in ``counts``.  The marginal survival
+    by the empirical context frequency in ``cc.counts``.  The marginal survival
     function S(t) = Σ_c w_c · p_match_c^t is then fitted with a Weibull.
 
-    The approximation ignores within-observation position-to-position context
-    changes (the true context shifts as bases are revealed), but it provides a
-    principled summary of the hazard-rate profile implied by the model and is
-    directly comparable across source / retrained / real models on the same
-    training distribution.
-
     Args:
-        counts: Context-by-target count tensor from aggregation.
+        cc: Aggregated context counts.
         params: Fitted parameter dict (MLE or VI posterior mean).
         v: Value-window length (max t in the survival function).
-        run_values: Optional run-length values for homopolymer models.
-        additive_context: Whether params use the additive parameterisation.
-        context_indices: Subsampled context indices when counts rows are a subset.
-        calibration_offset: Scalar offset applied to non-match logits (baked-in
-            calibration delta).
+        calibration_offset: Scalar offset applied to non-match logits.
 
     Returns:
         Dict with keys ``lambda``, ``beta``, ``window_averaged_rate``, and
         ``survival`` (list of S(1), …, S(v)).
     """
-    logits = _get_full_logits(params, counts, run_values, additive_context, context_indices, phred_context_sums, position_context_sums, strand_context_sums)
+    logits = _get_full_logits(cc, params)
+    counts = cc.counts
     calibrated = logits.clone()
     calibrated[..., 1:] += calibration_offset
 
@@ -2126,28 +2275,8 @@ def fit_and_test(
         seed=seed,
         progress_callback=progress_callback,
     )
-    train_ll = log_likelihood(
-        train_context_counts.counts,
-        params,
-        train_context_counts.run_values,
-        train_context_counts.additive_context,
-        context_indices=train_context_counts.context_indices,
-        phred_context_sums=train_context_counts.phred_context_sums,
-        position_context_sums=train_context_counts.position_context_sums,
-        strand_context_sums=train_context_counts.strand_context_sums,
-        fragment_count_per_context=train_context_counts.fragment_count_per_context,
-    )
-    test_ll = log_likelihood(
-        test_context_counts.counts,
-        params,
-        test_context_counts.run_values,
-        test_context_counts.additive_context,
-        context_indices=test_context_counts.context_indices,
-        phred_context_sums=test_context_counts.phred_context_sums,
-        position_context_sums=test_context_counts.position_context_sums,
-        strand_context_sums=test_context_counts.strand_context_sums,
-        fragment_count_per_context=test_context_counts.fragment_count_per_context,
-    )
+    train_ll = log_likelihood(train_context_counts, params)
+    test_ll = log_likelihood(test_context_counts, params)
     _n_phred = train_context_counts.phred_context_sums.shape[-1] if train_context_counts.phred_context_sums is not None else 0
     _n_pos = train_context_counts.position_context_sums.shape[-1] if train_context_counts.position_context_sums is not None else 0
     _use_strand = train_context_counts.strand_context_sums is not None
@@ -2210,28 +2339,8 @@ def fit_bayesian_and_test(
         seed=seed,
         progress_callback=progress_callback,
     )
-    train_ll = log_likelihood(
-        train_context_counts.counts,
-        params_mean,
-        train_context_counts.run_values,
-        train_context_counts.additive_context,
-        context_indices=train_context_counts.context_indices,
-        phred_context_sums=train_context_counts.phred_context_sums,
-        position_context_sums=train_context_counts.position_context_sums,
-        strand_context_sums=train_context_counts.strand_context_sums,
-        fragment_count_per_context=train_context_counts.fragment_count_per_context,
-    )
-    test_ll = log_likelihood(
-        test_context_counts.counts,
-        params_mean,
-        test_context_counts.run_values,
-        test_context_counts.additive_context,
-        context_indices=test_context_counts.context_indices,
-        phred_context_sums=test_context_counts.phred_context_sums,
-        position_context_sums=test_context_counts.position_context_sums,
-        strand_context_sums=test_context_counts.strand_context_sums,
-        fragment_count_per_context=test_context_counts.fragment_count_per_context,
-    )
+    train_ll = log_likelihood(train_context_counts, params_mean)
+    test_ll = log_likelihood(test_context_counts, params_mean)
     return BayesianFitResult(
         params_mean=params_mean,
         params_stdev=params_stdev,
@@ -2239,29 +2348,7 @@ def fit_bayesian_and_test(
         losses=losses,
         train_log_likelihood=train_ll,
         test_log_likelihood=test_ll,
-        train_elbo=-elbo_loss(
-            train_context_counts.counts,
-            params_mean,
-            run_values=train_context_counts.run_values,
-            additive_context=train_context_counts.additive_context,
-            prior_scale=prior_scale,
-            context_indices=train_context_counts.context_indices,
-            phred_context_sums=train_context_counts.phred_context_sums,
-            position_context_sums=train_context_counts.position_context_sums,
-            strand_context_sums=train_context_counts.strand_context_sums,
-            fragment_count_per_context=train_context_counts.fragment_count_per_context,
-        ),
-        test_elbo=-elbo_loss(
-            test_context_counts.counts,
-            params_mean,
-            run_values=test_context_counts.run_values,
-            additive_context=test_context_counts.additive_context,
-            prior_scale=prior_scale,
-            context_indices=test_context_counts.context_indices,
-            phred_context_sums=test_context_counts.phred_context_sums,
-            position_context_sums=test_context_counts.position_context_sums,
-            strand_context_sums=test_context_counts.strand_context_sums,
-            fragment_count_per_context=test_context_counts.fragment_count_per_context,
-        ),
+        train_elbo=-elbo_loss(train_context_counts, params_mean, prior_scale=prior_scale),
+        test_elbo=-elbo_loss(test_context_counts, params_mean, prior_scale=prior_scale),
         prior_scale=prior_scale,
     )

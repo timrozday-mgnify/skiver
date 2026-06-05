@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import functools
 import json
 import logging
 import sys
@@ -29,11 +30,13 @@ from lib.context_error_models import (
     ContextCounts,
     ContextLengthScreenCounts,
     FitResult,
+    ModelComponents,
     aggregate_context_length_screen_counts,
     calibrate_to_rate,
     compute_marginal_error_rate,
     fit_bayesian_and_test,
     fit_and_test,
+    parse_model_components,
     subsample_context_counts,
 )
 from lib.context_h5_cache import (
@@ -50,53 +53,62 @@ DEFAULT_PLATFORMS = ("hq-illumina", "lq-illumina", "ont", "pacbio")
 DEFAULT_MODEL_CONFIG = Path("model_config.json")
 PROGRESS_INTERVAL = 50_000
 
-MODEL_TYPES = ("combinatorial_context", "additive_context")
-
-
 @dataclass(frozen=True)
 class ModelSpec:
     """Specification for a single model to train.
 
+    Defined by a composable component string (``components`` field), e.g.
+    ``"AdditiveContext(6)+PhredContext(3)+Position(2)+Strand"``.
+    Use ``parse_model_components`` for the full component reference.
+
     Attributes:
         id: Unique identifier used in artifact filenames and CSV rows.
-        type: Parameterisation — ``"combinatorial_context"`` (full joint) or
-            ``"additive_context"`` (factored over positions).
-        context_length: Number of preceding consensus bases to condition on.
-        phred_lags: Number of previous Phred quality scores to use as covariates.
-        position_features: Number of read-position features to use as covariates
-            (0–2). Feature order: log1p(dist_to_end), log1p(read_pos).
-        use_strand: If True, include the forward-strand fraction per context as a
-            scalar covariate.
+        components: Component string that fully defines the model structure.
     """
 
     id: str
-    type: str
-    context_length: int
-    phred_lags: int = 0
-    position_features: int = 0
-    use_strand: bool = False
-    use_fragment_overdispersion: bool = False
+    components: str
 
     def __post_init__(self) -> None:
-        if self.type not in MODEL_TYPES:
-            raise ValueError(
-                f"Unknown model type {self.type!r}. Must be one of {MODEL_TYPES}."
-            )
-        if self.context_length < 1:
-            raise ValueError("context_length must be at least 1")
-        if self.phred_lags < 0:
-            raise ValueError("phred_lags must be non-negative")
-        if not (0 <= self.position_features <= 2):
-            raise ValueError("position_features must be 0, 1, or 2")
+        parse_model_components(self.components)  # validate on construction
+
+    @functools.cached_property
+    def _parsed(self) -> ModelComponents:
+        return parse_model_components(self.components)
+
+    @property
+    def context_length(self) -> int:
+        return self._parsed.context_length
 
     @property
     def additive_context(self) -> bool:
-        """Return True when this spec uses additive context parameterisation."""
-        return self.type == "additive_context"
+        return self._parsed.additive_context
+
+    @property
+    def phred_lags(self) -> int:
+        return self._parsed.num_phred_lags
+
+    @property
+    def position_features(self) -> int:
+        return self._parsed.num_position_features
+
+    @property
+    def use_strand(self) -> bool:
+        return self._parsed.use_strand
+
+    @property
+    def use_fragment_overdispersion(self) -> bool:
+        return self._parsed.use_fragment_overdispersion
+
+    @property
+    def use_homopolymer(self) -> bool:
+        return self._parsed.use_homopolymer
 
 
 def load_model_config(path: Path) -> list[ModelSpec]:
     """Load and validate a JSON model config file.
+
+    Each entry must have ``"id"`` and ``"components"`` fields.
 
     Args:
         path: Path to a JSON file with a ``"models"`` list.
@@ -116,18 +128,10 @@ def load_model_config(path: Path) -> list[ModelSpec]:
     specs = []
     seen_ids: set[str] = set()
     for i, entry in enumerate(raw["models"]):
-        for field in ("id", "type", "context_length"):
+        for field in ("id", "components"):
             if field not in entry:
                 raise ValueError(f"{path}: model[{i}] is missing field {field!r}")
-        spec = ModelSpec(
-            id=str(entry["id"]),
-            type=str(entry["type"]),
-            context_length=int(entry["context_length"]),
-            phred_lags=int(entry.get("phred_lags", 0)),
-            position_features=int(entry.get("position_features", 0)),
-            use_strand=bool(entry.get("use_strand", False)),
-            use_fragment_overdispersion=bool(entry.get("use_fragment_overdispersion", False)),
-        )
+        spec = ModelSpec(id=str(entry["id"]), components=str(entry["components"]))
         if spec.id in seen_ids:
             raise ValueError(f"{path}: duplicate model id {spec.id!r}")
         seen_ids.add(spec.id)
@@ -236,7 +240,7 @@ def _save_artifact(
 
     artifact = {
         "model_id": spec.id,
-        "model_type": spec.type,
+        "model_components": spec.components,
         "platform": platform,
         "data_root": str(data_root),
         "train_prefixes": [str(p) for p in train_prefixes],
@@ -245,7 +249,7 @@ def _save_artifact(
         "n_test": test_total,
         "low_count_contexts": low_count_contexts,
         "context_length": spec.context_length,
-        "parameterization": spec.type,
+        "parameterization": spec.components,
         "target": "error_type",
         "notes": (
             "Conditional categorical error model. Sequence context is treated as "
@@ -1055,48 +1059,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             calibration: dict[str, float] | None = None
             if args.weibull_rate is not None:
-                raw_mle = compute_marginal_error_rate(
-                    train_counts.counts,
-                    mle_fit.params,
-                    run_values=train_counts.run_values,
-                    additive_context=train_counts.additive_context,
-                    context_indices=train_counts.context_indices,
-                    phred_context_sums=train_counts.phred_context_sums,
-                    position_context_sums=train_counts.position_context_sums,
-                    strand_context_sums=train_counts.strand_context_sums,
-                )
-                delta_mle = calibrate_to_rate(
-                    train_counts.counts,
-                    mle_fit.params,
-                    args.weibull_rate,
-                    run_values=train_counts.run_values,
-                    additive_context=train_counts.additive_context,
-                    context_indices=train_counts.context_indices,
-                    phred_context_sums=train_counts.phred_context_sums,
-                    position_context_sums=train_counts.position_context_sums,
-                    strand_context_sums=train_counts.strand_context_sums,
-                )
-                raw_vi = compute_marginal_error_rate(
-                    train_counts.counts,
-                    vi_fit.params_mean,
-                    run_values=train_counts.run_values,
-                    additive_context=train_counts.additive_context,
-                    context_indices=train_counts.context_indices,
-                    phred_context_sums=train_counts.phred_context_sums,
-                    position_context_sums=train_counts.position_context_sums,
-                    strand_context_sums=train_counts.strand_context_sums,
-                )
-                delta_vi = calibrate_to_rate(
-                    train_counts.counts,
-                    vi_fit.params_mean,
-                    args.weibull_rate,
-                    run_values=train_counts.run_values,
-                    additive_context=train_counts.additive_context,
-                    context_indices=train_counts.context_indices,
-                    phred_context_sums=train_counts.phred_context_sums,
-                    position_context_sums=train_counts.position_context_sums,
-                    strand_context_sums=train_counts.strand_context_sums,
-                )
+                raw_mle = compute_marginal_error_rate(train_counts, mle_fit.params)
+                delta_mle = calibrate_to_rate(train_counts, mle_fit.params, args.weibull_rate)
+                raw_vi = compute_marginal_error_rate(train_counts, vi_fit.params_mean)
+                delta_vi = calibrate_to_rate(train_counts, vi_fit.params_mean, args.weibull_rate)
                 calibration = {
                     "weibull_target_rate": args.weibull_rate,
                     "uncalibrated_mle_rate": raw_mle,
@@ -1139,7 +1105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows.append(
                 {
                     "model_id": spec.id,
-                    "model_type": spec.type,
+                    "model_type": spec.components,
                     "platform": platform,
                     "context_length": spec.context_length,
                     "inference": "maximum_likelihood",
@@ -1161,7 +1127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows.append(
                 {
                     "model_id": spec.id,
-                    "model_type": spec.type,
+                    "model_type": spec.components,
                     "platform": platform,
                     "context_length": spec.context_length,
                     "inference": "variational_inference",

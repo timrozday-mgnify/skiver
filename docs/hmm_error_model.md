@@ -454,7 +454,249 @@ python scripts/train_profile_hmm.py prefix_R1 prefix_R2 \
 
 ---
 
-## 8. How the components relate
+## 8. Composable context error model
+
+The non-HMM context error model (`scripts/train_context_error_models.py`,
+`scripts/lib/context_error_models.py`) models:
+
+```
+P(error_type | preceding bases, covariates)
+```
+
+as a categorical distribution whose log-probabilities are a linear combination
+of a base-context table and optional additive covariate contributions. Each
+model is fully described by a **component string** — a `+`-separated list of
+tokens specifying which effects to include.
+
+### 8.1 Component reference
+
+Components are separated by `+`.  Parameterised components use `Name(N)` syntax.
+Exactly one context component (`BaseContext` or `AdditiveContext`) is required;
+all others are optional and may appear in any order.
+
+#### `BaseContext(N)` — combinatorial context table
+
+Models the full joint distribution of the N preceding consensus bases as
+independent parameter rows.  Encodes 4^N context rows, each with
+`NUM_ERROR_TYPES − 1` free parameters.
+
+- **Use when:** N ≤ 4.  Four bases of context = 256 rows.  Larger N becomes
+  memory-prohibitive and the table grows too sparse to fit reliably.
+- **Parameters added:** 4^N × (E − 1) where E = 10 error types.
+- **Example:** `BaseContext(2)` — conditions on the two preceding bases.
+
+#### `AdditiveContext(N)` — factored additive context
+
+Replaces the full joint table with an additive decomposition: each of the N
+preceding positions contributes independently to log-odds.
+
+```
+logit(error_type | ctx) = intercept + Σ_{i=1}^{N} base_effect[i, base_i]
+```
+
+- **Use when:** N ≥ 5.  Scales linearly with N; a 12-base model uses
+  `(1 + 3×12) × (E − 1)` ≈ 333 parameters rather than 4^12 × 9 ≈ 38 million.
+- **Parameters added:** `(1 + (4 − 1) × N) × (E − 1)`.
+- **Example:** `AdditiveContext(8)` — 8 preceding bases, ~270 free parameters.
+
+#### `PhredContext(N)` — Phred quality covariates
+
+Adds N preceding Phred quality scores as additive linear covariates.  The N
+most-recently observed integer Phred values are averaged per context row before
+the dot-product with learned weight matrices, so a context row with many
+observations effectively sees the mean Phred lag at that context.
+
+- **What it captures:** sequencer miscalibration — the model learns how much
+  the instrument-reported quality deviates from the true error probability,
+  conditional on base context.
+- **Parameters added:** N × (E − 1).
+- **Example:** `PhredContext(3)` — uses the 3 most-recent Phred scores.
+
+#### `Position(N)` — read-position covariates
+
+Adds N read-position features as additive covariates.  N must be 1 or 2.
+
+- **N = 1:** `log1p(dist_to_read_end)` — captures 3′-end degradation.  The
+  log transform compresses the long tail of very-long reads.
+- **N = 2:** additionally adds `log1p(read_pos)` — captures both 3′ and 5′
+  effects.  Use N = 2 when both ends show elevated error rates (e.g. PacBio).
+- **Parameters added:** N × (E − 1).
+- **Example:** `Position(1)` for Illumina (3′ degradation only).
+
+#### `Strand` — strand-asymmetry covariate
+
+Adds the per-context forward-strand fraction as a scalar additive covariate.
+Captures strand-asymmetric damage chemistry such as oxidative G→T / C→A
+paired damage or FFPE-type C→T deamination enriched on one strand.  When
+strand asymmetry is absent the learned weight vector converges to zero.
+
+- **Parameters added:** 1 × (E − 1) = 9 parameters.
+- **Example:** `Strand`.
+
+#### `FragmentOverdispersion` — Dirichlet-Multinomial likelihood
+
+Replaces the Multinomial likelihood with a Dirichlet-Multinomial (DM).  Models
+between-fragment variability in error rate: different DNA fragments may carry
+different error loads (e.g. due to damage heterogeneity across the sample).
+
+- **What it adds:** one scalar concentration parameter φ (> 0).  When
+  φ → ∞ the DM recovers the Multinomial.  Requires `fragment_id` column in
+  the TSV files (produced by `skiver dump`).
+- **Parameters added:** 1 (the scalar φ).
+- **Example:** `FragmentOverdispersion`.
+
+#### `Homopolymer` — run-length effect *(screen aggregation not yet supported)*
+
+Adds a learnable monotone scalar run-length transform and per-context slope to
+model the elevated indel rates in homopolymer runs.  Currently only available
+through the platform-level aggregation path (`aggregate_platform_counts`); raises
+`NotImplementedError` when used with `aggregate_context_length_screen_counts`.
+
+---
+
+### 8.2 Component string examples
+
+| String | Description |
+|---|---|
+| `"BaseContext(1)"` | Single-base context, no covariates. Minimal baseline. |
+| `"BaseContext(3)"` | Trinucleotide context. Standard starting point for Illumina. |
+| `"AdditiveContext(6)"` | 6-base additive context. Good balance for all platforms. |
+| `"AdditiveContext(12)"` | 12-base additive context. Long-range context for ONT. |
+| `"AdditiveContext(6)+Strand"` | Adds strand-asymmetry correction. |
+| `"AdditiveContext(6)+PhredContext(3)"` | Context + 3 Phred lags. Captures calibration effects. |
+| `"AdditiveContext(6)+PhredContext(3)+Position(1)"` | Adds 3′ degradation. Recommended for Illumina. |
+| `"AdditiveContext(6)+PhredContext(3)+Position(2)+Strand"` | Full covariate set for short-read platforms. |
+| `"AdditiveContext(8)+Position(2)+Strand+FragmentOverdispersion"` | With between-fragment overdispersion. |
+
+---
+
+### 8.3 Model config JSON format
+
+Models are listed in `scripts/model_config.json`.  Each entry needs only `"id"`
+and `"components"`:
+
+```json
+{
+  "models": [
+    {"id": "context_1",   "components": "BaseContext(1)"},
+    {"id": "context_3",   "components": "BaseContext(3)"},
+    {"id": "additive_6",  "components": "AdditiveContext(6)"},
+    {"id": "ctx_phred",   "components": "AdditiveContext(6)+PhredContext(3)+Position(1)+Strand"}
+  ]
+}
+```
+
+All models in the config file are trained in one run.  Each model is
+independently fitted on the same aggregated count tensors, so adding a new
+model to the config does not require re-reading the TSV files.
+
+---
+
+### 8.4 Training
+
+```bash
+cd scripts
+
+# Basic: all models in model_config.json, all platforms
+python train_context_error_models.py --data-root ../skiver_run
+
+# With Phred and position covariates (overrides per-model settings)
+python train_context_error_models.py \
+  --data-root ../skiver_run \
+  --phred-lags 3 \
+  --position-features 1
+
+# With fragment overdispersion (requires fragment_id column in TSVs)
+python train_context_error_models.py \
+  --data-root ../skiver_run \
+  --fragment-overdispersion
+
+# Strand covariate globally for all models
+python train_context_error_models.py \
+  --data-root ../skiver_run \
+  --strand-covariate
+
+# Large additive models: cap training to 4096 most-observed contexts
+python train_context_error_models.py \
+  --data-root ../skiver_run \
+  --max-contexts 4096
+
+# Calibrate to a Weibull-estimated rate
+python train_context_error_models.py \
+  --data-root ../skiver_run \
+  --weibull-rate 0.0072
+```
+
+Each trained model is saved as `{output-dir}/{model_id}_{platform}.pt` alongside
+an AIC comparison CSV at `{output-dir}/context_model_aic.csv`.
+
+---
+
+### 8.5 Programmatic API
+
+```python
+from lib.context_error_models import (
+    parse_model_components,
+    aggregate_context_length_screen_counts,
+    fit_and_test,
+    log_likelihood,
+    compute_marginal_error_rate,
+    calibrate_to_rate,
+    compute_marginal_weibull,
+)
+
+# Parse a component string
+mc = parse_model_components("AdditiveContext(6)+PhredContext(3)+Strand")
+# mc.context_length == 6, mc.additive_context == True,
+# mc.num_phred_lags == 3, mc.use_strand == True
+
+# Aggregate counts from TSV files
+screen = aggregate_context_length_screen_counts(
+    prefixes,                    # list of skiver dump prefixes
+    context_lengths=[6],
+    num_phred_lags=3,
+    use_strand=True,
+)
+cc = screen.by_length[6]
+
+# Train and evaluate (returns FitResult with params, losses, AIC)
+result = fit_and_test(cc, test_cc, num_steps=1000)
+
+# Evaluate on any ContextCounts — all evaluation functions take (cc, params)
+ll    = log_likelihood(cc, result.params)
+rate  = compute_marginal_error_rate(cc, result.params)
+delta = calibrate_to_rate(cc, result.params, target_rate=0.0072)
+wb    = compute_marginal_weibull(cc, result.params, v=13)
+```
+
+All evaluation functions (`log_likelihood`, `elbo_loss`,
+`compute_marginal_error_rate`, `calibrate_to_rate`, `compute_marginal_weibull`)
+take a `ContextCounts` object as their first argument.  The `ContextCounts`
+carries all aggregated covariate tensors (`phred_context_sums`,
+`position_context_sums`, `strand_context_sums`, `fragment_count_per_context`)
+alongside the error-type counts, so there is no need to pass covariate tensors
+separately.
+
+---
+
+### 8.6 Choosing components
+
+| Platform | Recommended starting point |
+|---|---|
+| High-quality Illumina (HQ) | `AdditiveContext(6)+PhredContext(3)+Position(1)` |
+| Low-quality / degraded Illumina | `AdditiveContext(6)+PhredContext(3)+Position(1)+Strand` |
+| Oxford Nanopore (ONT) | `AdditiveContext(8)+Position(2)` |
+| PacBio | `AdditiveContext(6)+Position(2)` |
+| FFPE / ancient DNA | add `Strand` to any of the above |
+| Paired-end (R1/R2 batch) | add `FragmentOverdispersion` to capture between-read variance |
+
+Use AIC (the `aic` column in `context_model_aic.csv`) to compare model
+configurations trained on the same dataset.  A lower AIC means better
+predictive accuracy after penalising for parameter count.
+
+---
+
+## 9. How the components relate
 
 ```
 skiver analyze → summary_error_rate.csv      (scalar λ, β, per-base error rate)

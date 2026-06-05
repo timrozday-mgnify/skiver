@@ -408,37 +408,16 @@ def _save_retrained_artifact(
         }
     calibration: dict[str, float] | None = None
     if weibull_rate is not None:
-        additive = parameterization == "additive_context"
-        raw_mle = compute_marginal_error_rate(
-            train_counts.counts, fit_params,
-            run_values=train_counts.run_values,
-            additive_context=additive,
-            context_indices=train_counts.context_indices,
-        )
-        delta_mle = calibrate_to_rate(
-            train_counts.counts, fit_params, weibull_rate,
-            run_values=train_counts.run_values,
-            additive_context=additive,
-            context_indices=train_counts.context_indices,
-        )
+        raw_mle = compute_marginal_error_rate(train_counts, fit_params)
+        delta_mle = calibrate_to_rate(train_counts, fit_params, weibull_rate)
         calibration = {
             "weibull_target_rate": weibull_rate,
             "uncalibrated_mle_rate": raw_mle,
             "calibration_offset_mle": delta_mle,
         }
         if vi_fit is not None:
-            raw_vi = compute_marginal_error_rate(
-                train_counts.counts, vi_fit.params_mean,
-                run_values=train_counts.run_values,
-                additive_context=additive,
-                context_indices=train_counts.context_indices,
-            )
-            delta_vi = calibrate_to_rate(
-                train_counts.counts, vi_fit.params_mean, weibull_rate,
-                run_values=train_counts.run_values,
-                additive_context=additive,
-                context_indices=train_counts.context_indices,
-            )
+            raw_vi = compute_marginal_error_rate(train_counts, vi_fit.params_mean)
+            delta_vi = calibrate_to_rate(train_counts, vi_fit.params_mean, weibull_rate)
             calibration["uncalibrated_vi_rate"] = raw_vi
             calibration["calibration_offset_vi"] = delta_vi
         logger.info(
@@ -449,20 +428,10 @@ def _save_retrained_artifact(
 
     # Marginal Weibull parameters predicted by the model on the training distribution.
     # Uses a mixture-of-geometrics approximation; see compute_marginal_weibull docstring.
-    mle_weibull = compute_marginal_weibull(
-        train_counts.counts, fit_params, v,
-        run_values=train_counts.run_values,
-        additive_context=additive,
-        context_indices=train_counts.context_indices,
-    )
+    mle_weibull = compute_marginal_weibull(train_counts, fit_params, v)
     marginal_weibull: dict[str, object] = {"maximum_likelihood": mle_weibull}
     if vi_fit is not None:
-        vi_weibull = compute_marginal_weibull(
-            train_counts.counts, vi_fit.params_mean, v,
-            run_values=train_counts.run_values,
-            additive_context=additive,
-            context_indices=train_counts.context_indices,
-        )
+        vi_weibull = compute_marginal_weibull(train_counts, vi_fit.params_mean, v)
         marginal_weibull["variational_inference"] = vi_weibull
     artifact["marginal_weibull"] = marginal_weibull
     artifact["v"] = v
@@ -2541,12 +2510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     source_artifact = _load_artifact(args.model)
     source_params = source_artifact["maximum_likelihood"]["params"]  # type: ignore[index]
-    source_rate = compute_marginal_error_rate(
-        train_counts.counts, source_params,  # type: ignore[arg-type]
-        run_values=train_counts.run_values,
-        additive_context=additive_context,
-        context_indices=train_counts.context_indices,
-    )
+    source_rate = compute_marginal_error_rate(train_counts, source_params)  # type: ignore[arg-type]
     logger.info("Source model marginal error rate on training data: %.6f", source_rate)
     if weibull_rate is not None:
         logger.info("Weibull window-averaged rate: %.6f (not used as calibration target)", weibull_rate)
