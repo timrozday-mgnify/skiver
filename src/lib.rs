@@ -1,40 +1,42 @@
-pub mod kvmer;
-pub mod seeding;
-pub mod types;
 pub mod analyze;
 pub mod cmdline;
-pub mod inference;
-pub mod utils;
-pub mod sketch;
 pub mod constants;
-pub mod mapping;
-pub mod huber;
-pub mod summary;
 pub mod dump;
+pub mod huber;
+pub mod inference;
+pub mod kvmer;
+pub mod mapping;
+pub mod seeding;
+pub mod sketch;
+pub mod summary;
+pub mod types;
+pub mod utils;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2_seeding;
 
-
 #[cfg(test)]
 mod tests {
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
-    use super::*;
+    use crate::types::EditOperation::*;
+    use crate::utils::{_get_neighbors, _kmer_to_string};
 
-    use crate::utils::*;
-
+    /// Decoding round-trips the 2-bit encoding, and no substitution neighbour of
+    /// a value equals the value itself.
     #[test]
     fn test_kmer_neighbors() {
-        let value = 0b11000001110111;
+        let value = 0b11_00_00_01_11_01_11; // 7 bases
+        assert_eq!(_kmer_to_string(value, 7), "TAACTCT");
 
-        let value_length = 7;
-        //let key_length = 5; // arbitrary
-
-        //let kvmer = kvmer::KVmerSet::new(key_length, value_length, false);
-        //let neighbors = _get_neighbors(value, value_length, false);
-        println!("Original value: {}", _kmer_to_string(value, value_length));
-        _show_neighbors(value, value_length, true);
-        
-        assert_eq!(1., 2.);
+        let neighbors = _get_neighbors(value, 7);
+        assert!(!neighbors.is_empty());
+        for (&nbr, info) in &neighbors {
+            let is_substitution = matches!(
+                info.op,
+                AC | AG | AT | CA | CG | CT | GA | GC | GT | TA | TC | TG
+            );
+            if is_substitution {
+                assert_ne!(nbr, value);
+            }
+        }
     }
 }

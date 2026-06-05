@@ -178,6 +178,52 @@ Apart from `plot_all.py`, you can also use the individual scripts and adjust the
     <img src="./figures/SRR7498042_read_position.png"/>
   </p> 
 
+## Synthetic error-model recovery test
+
+Context error models saved as `context_error_models/*.pt` can be used to
+generate synthetic FASTQ reads with the sibling `../genome-blender` checkout,
+run `skiver dump --base` on those reads, retrain the same model family, and
+compare the recovered probabilities with the model used for generation:
+
+```bash
+python scripts/benchmark_simulated_context_model.py \
+  --model context_error_models/additive_7_hq-illumina.pt \
+  --reference reference.fa \
+  -o synthetic_recovery/additive_7_hq_illumina \
+  --genome-blender-dir ../genome-blender \
+  --genome-blender-conda-env genome_blender_dev \
+  --joint-phred-calibration-json examples/amplicon_synthetic_recovery/source_joint_quality_model.json \
+  --quality-calibration-model-json examples/amplicon_synthetic_recovery/source_quality_calibration_model.json \
+  --quality-calibration-fit-model log-linear \
+  --n-copies 1000 \
+  --k 21 --v 13 --c 1 \
+  --steps 1000
+```
+
+The empirical joint Phred model is used for generation; the Q-to-error
+calibration model is retained as a validation target. The main output is
+`recovery_metrics.json`, containing source, Skiver-observed, and retrained
+marginal error rates plus KL/total-variation distances. See
+[`docs/hmm_error_model.md`](./docs/hmm_error_model.md#10-synthetic-context-model-recovery-benchmark)
+for full-scale test guidance and interpretation.
+
+For recovery tests, model training applies the same true-base mask that
+genome-blender applies during generation. A destination-base substitution such
+as `sub_to_A` is impossible when the true base is already `A`, so the likelihood
+masks that self-substitution category before normalising probabilities. This
+prevents training from assigning probability mass to categories that the
+generator will later remove, keeping source and retrained marginal error rates
+comparable.
+
+## Performance & implementation notes
+
+[`docs/performance.md`](docs/performance.md) documents the hot-path design choices
+(flat count map, allocation-free per-key grouping, deterministic consensus, the
+`FxHash` fast hasher, no-quality buffer-reused counting) together with the CPU and
+memory **profiling methodology and measured evidence** — including the changes that did
+*not* pay off (e.g. threading the seed+count loop) and why. The raw per-run artifacts
+live under `examples/shotgun_synthetic_recovery_v2/` (`MEMORY_PROFILE.md`,
+`PERFORMANCE_PROFILE.md`).
 
 ## Contribution
 

@@ -1,0 +1,1249 @@
+## Setup
+
+```{python}
+#| echo: false
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import torch
+from IPython.display import Markdown, display
+from scipy import stats
+from scipy.cluster.hierarchy import leaves_list, linkage
+
+# ── Error-type constants ───────────────────────────────────────────────────────
+
+DEFAULT_BASES = ("A", "C", "G", "T")
+LEGACY_BASES = ("A", "C", "G", "T", "N")
+ERROR_LABELS = (
+    "match",
+    "sub_to_A", "sub_to_C", "sub_to_G", "sub_to_T",
+    "ins_A", "ins_C", "ins_G", "ins_T",
+    "deletion",
+)
+_ERROR_GROUP: dict[str, str] = {
+    "match": "match",
+    "sub_to_A": "substitution", "sub_to_C": "substitution",
+    "sub_to_G": "substitution", "sub_to_T": "substitution",
+    "ins_A": "insertion", "ins_C": "insertion",
+    "ins_G": "insertion", "ins_T": "insertion",
+    "deletion": "deletion",
+}
+_GROUP_COLORS = {"match": "#4477AA", "substitution": "#EE6677",
+                 "insertion": "#228833", "deletion": "#CCBB44"}
+_BASE_COLORS = {"A": "#4477AA", "C": "#EE6677", "G": "#228833", "T": "#CCBB44", "N": "#AA3377"}
+
+
+def _error_type_group(error_type: str) -> str:
+    return _ERROR_GROUP.get(error_type, "other")
+```
+
+## Parameter Category Registry
+
+The `PARAMETER_CATEGORIES` list defines the axes along which model parameters are
+coloured in the per-model volcano plots. Each entry maps a display label to a
+column that must exist (or be derived) in the parameter rows DataFrame.
+
+**To add a new category for a future model type** (e.g. homopolymer run length,
+latent state), append a new `ParameterCategory` to this list and populate the
+corresponding column in the extraction functions below.
+
+```{python}
+@dataclass
+class ParameterCategory:
+    """Specification for one colour dimension in a parameter volcano plot.
+
+    Attributes:
+        key: Internal identifier used to match columns in the DataFrame.
+        label: Short name shown in the dropdown button.
+        column: Column name expected in the parameter DataFrame.
+        description: Sentence shown as the plot subtitle when this category
+            is active. Helps readers interpret the colouring.
+        colors: Ordered colour sequence; values cycle if there are more unique
+            category levels than colours.
+    """
+
+    key: str
+    label: str
+    column: str
+    description: str
+    colors: list[str] = field(default_factory=lambda: list(px.colors.qualitative.Plotly))
+
+
+PARAMETER_CATEGORIES: list[ParameterCategory] = [
+    ParameterCategory(
+        key="error_type_group",
+        label="Error group",
+        column="error_type_group",
+        description="Grouped error class: match / substitution / insertion / deletion",
+        colors=list(_GROUP_COLORS.values()),
+    ),
+    ParameterCategory(
+        key="error_type",
+        label="Error type (detailed)",
+        column="error_type",
+        description="All 10 error categories including each substitution and insertion direction",
+    ),
+    ParameterCategory(
+        key="nearest_base",
+        label="Nearest preceding base",
+        column="nearest_base",
+        description="The immediately preceding consensus base (rightmost context character)",
+        colors=[_BASE_COLORS.get(b, "#888888") for b in ("A", "C", "G", "T", "N")],
+    ),
+    ParameterCategory(
+        key="context_distance",
+        label="Context distance",
+        column="context_distance",
+        description=(
+            "Distance of the influencing base from the current position "
+            "(1 = immediately preceding; only available for position-decomposed parameters)"
+        ),
+    ),
+    ParameterCategory(
+        key="context_base",
+        label="Context base",
+        column="context_base",
+        description="Which nucleotide occupies the influencing position",
+        colors=[_BASE_COLORS.get(b, "#888888") for b in ("A", "C", "G", "T", "N")],
+    ),
+    # ── Future categories — uncomment and implement extraction when available ──
+    # ParameterCategory(
+    #     key="homopolymer_feature",
+    #     label="Homopolymer feature",
+    #     column="homopolymer_feature",
+    #     description="Homopolymer run-length bin or run-base identity",
+    # ),
+    # ParameterCategory(
+    #     key="latent_state",
+    #     label="Latent state",
+    #     column="latent_state",
+    #     description="Hidden Markov model latent state index",
+    # ),
+]
+```
+
+## Data Loading
+
+```{python}
+#| echo: false
+def load_artifact(path) -> dict:
+    """Load a torch model artifact across PyTorch versions."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def get_model_id(artifact: dict) -> str:
+    """Return model identifier, handling both old and new artifact formats."""
+    return str(artifact.get("model_id") or artifact.get("model", "unknown"))
+
+
+def get_model_type(artifact: dict) -> str:
+    """Return model type string, handling both old and new artifact formats."""
+    raw = artifact.get("model_type") or artifact.get("parameterization", "combinatorial_context")
+    # Normalise legacy values
+    if raw in ("full_context", "context"):
+        return "combinatorial_context"
+    return str(raw)
+
+
+aic_path = RESULTS_DIR / "context_model_aic.csv"
+if not aic_path.exists():
+    raise FileNotFoundError(f"Missing comparison CSV: {aic_path}")
+
+comparison = pd.read_csv(aic_path)
+
+# ── Backward-compat: ensure model_id / model_type columns exist ───────────────
+if "model_id" not in comparison.columns:
+    comparison["model_id"] = comparison.get("model", pd.Series(dtype=str))
+if "model_type" not in comparison.columns:
+    _pmap = {
+        "additive_context":    "additive_context",
+        "full_context":        "combinatorial_context",
+        "context":             "combinatorial_context",
+    }
+    comparison["model_type"] = comparison.get(
+        "parameterization", pd.Series(dtype=str)
+    ).map(_pmap).fillna("combinatorial_context")
+
+_numeric_cols = [
+    "context_length", "n_train", "n_test",
+    "train_log_likelihood", "test_log_likelihood",
+    "train_elbo", "test_elbo",
+    "num_parameters", "aic", "low_count_contexts", "prior_scale",
+]
+for _col in _numeric_cols:
+    if _col in comparison.columns:
+        comparison[_col] = pd.to_numeric(comparison[_col], errors="coerce")
+
+# ── Load artifacts ─────────────────────────────────────────────────────────────
+artifact_paths = sorted(RESULTS_DIR.glob(ARTIFACT_GLOB))
+if not artifact_paths:
+    raise FileNotFoundError(f"No context model artifacts matching '{ARTIFACT_GLOB}' in {RESULTS_DIR}")
+
+_raw_artifacts = {path.stem: load_artifact(path) for path in artifact_paths}
+print(f"Loaded {len(_raw_artifacts)} artifacts from {RESULTS_DIR.resolve()}")
+
+# ── Platform filtering ─────────────────────────────────────────────────────────
+if PLATFORM != "all":
+    artifacts = {k: v for k, v in _raw_artifacts.items() if v.get("platform") == PLATFORM}
+    comparison = comparison[comparison["platform"] == PLATFORM].copy()
+    print(f"Filtered to platform '{PLATFORM}': {len(artifacts)} artifacts")
+else:
+    artifacts = _raw_artifacts
+
+# ── Align comparison CSV to loaded artifacts ───────────────────────────────────
+_artifact_keys = {
+    (get_model_id(a), a.get("platform", ""))
+    for a in artifacts.values()
+}
+comparison = comparison[
+    comparison.apply(
+        lambda r: (str(r["model_id"]), str(r["platform"])) in _artifact_keys,
+        axis=1,
+    )
+].copy()
+comparison.head(3)
+```
+
+## Model Performance
+
+```{python}
+#| echo: false
+perf = comparison.copy()
+perf["train_nll_per_base"] = -perf["train_log_likelihood"] / perf["n_train"]
+perf["test_nll_per_base"] = -perf["test_log_likelihood"] / perf["n_test"]
+perf["test_perplexity"] = np.exp(perf["test_nll_per_base"])
+
+mle = perf[perf["inference"] == "maximum_likelihood"].copy()
+if not mle.empty:
+    mle["delta_aic"] = mle.groupby("platform")["aic"].transform(lambda x: x - x.min())
+    mle["aic_ratio_to_min"] = mle.groupby("platform")["aic"].transform(
+        lambda x: x / x.min()
+    )
+    mle["akaike_weight"] = mle.groupby("platform")["delta_aic"].transform(
+        lambda x: np.exp(-0.5 * x) / np.exp(-0.5 * x).sum()
+    )
+
+vi = perf[perf["inference"] == "variational_inference"].copy()
+if not vi.empty:
+    vi["test_elbo_per_base"] = vi["test_elbo"] / vi["n_test"]
+```
+
+```{python}
+#| label: fig-test-nll
+#| fig-cap: "Held-out negative log-likelihood per base by context length and model type."
+#| fig-alt: "Line plot of test NLL per base faceted by model type."
+fig = px.line(
+    perf,
+    x="context_length",
+    y="test_nll_per_base",
+    color="platform" if PLATFORM == "all" else "model_type",
+    line_dash="inference",
+    symbol="model_type",
+    markers=True,
+    hover_data=["model_id", "model_type", "n_test", "test_log_likelihood", "test_perplexity"],
+    facet_col="model_type" if PLATFORM == "all" else None,
+    title="Held-out NLL per base",
+)
+fig.update_layout(
+    xaxis_title="Context length",
+    yaxis_title="NLL per base",
+    template="plotly_white",
+)
+fig.update_yaxes(type="log")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.show()
+```
+
+```{python}
+#| label: fig-aic
+#| fig-cap: "AIC relative to the best model per platform."
+#| fig-alt: "Line plot of AIC ratio for maximum-likelihood fits."
+if mle.empty:
+    print("No maximum-likelihood rows available.")
+else:
+    fig = px.line(
+        mle,
+        x="context_length",
+        y="aic_ratio_to_min",
+        color="platform" if PLATFORM == "all" else "model_id",
+        line_dash="model_type",
+        symbol="model_type",
+        markers=True,
+        hover_data=["model_id", "model_type", "num_parameters", "aic", "delta_aic", "akaike_weight"],
+        title="AIC / minimum AIC per platform",
+    )
+    fig.update_layout(
+        xaxis_title="Context length",
+        yaxis_title="AIC / minimum AIC",
+        template="plotly_white",
+    )
+    fig.update_yaxes(type="log")
+    fig.show()
+```
+
+```{python}
+#| echo: false
+_display_cols = [
+    "platform", "model_id", "model_type", "context_length", "inference",
+    "n_train", "n_test", "test_nll_per_base", "test_perplexity",
+    "num_parameters", "aic",
+]
+perf[[c for c in _display_cols if c in perf.columns]].sort_values(
+    ["platform", "model_type", "context_length", "inference"]
+)
+```
+
+## Parameter Extraction
+
+```{python}
+#| echo: false
+def _base_labels_for_params(params: dict, context_length: int) -> tuple[str, ...]:
+    if "base_logits" in params:
+        return LEGACY_BASES[: int(params["base_logits"].shape[1])]
+    if "logits" in params:
+        count = int(params["logits"].reshape(-1, len(ERROR_LABELS)).shape[0])
+        for bases in (DEFAULT_BASES, LEGACY_BASES):
+            if count == len(bases) ** context_length:
+                return bases
+    return DEFAULT_BASES
+
+
+def _decode_context(index: int, context_length: int, base_labels: tuple) -> str:
+    parts = []
+    cur = int(index)
+    for _ in range(context_length):
+        parts.append(base_labels[cur % len(base_labels)])
+        cur //= len(base_labels)
+    return "".join(reversed(parts))
+
+
+def _context_base_matrix(context_length: int, base_count: int, indices: np.ndarray | None = None) -> np.ndarray:
+    if indices is None:
+        indices = np.arange(base_count ** context_length)
+    cols = []
+    for pos in range(context_length):
+        div = base_count ** (context_length - pos - 1)
+        cols.append((indices // div) % base_count)
+    return np.stack(cols, axis=1)
+
+
+def _compose_logits(params: dict, context_length: int, ctx_indices: np.ndarray | None = None) -> np.ndarray:
+    if "logits" in params:
+        logits = params["logits"].detach().cpu().numpy().reshape(-1, len(ERROR_LABELS))
+        return logits if ctx_indices is None else logits[ctx_indices]
+    intercept = params["intercept_logits"].detach().cpu().numpy()
+    base_logits = params["base_logits"].detach().cpu().numpy()
+    base_logits = base_logits - base_logits.mean(axis=1, keepdims=True)
+    bm = _context_base_matrix(context_length, base_logits.shape[1], ctx_indices)
+    logits = np.broadcast_to(intercept, (bm.shape[0], len(ERROR_LABELS))).copy()
+    for pos in range(context_length):
+        logits += base_logits[pos, bm[:, pos], :]
+    return logits
+
+
+def _compose_logit_sd(stdevs: dict, context_length: int, ctx_indices: np.ndarray | None = None) -> np.ndarray:
+    if "logits" in stdevs:
+        sd = stdevs["logits"].detach().cpu().numpy().reshape(-1, len(ERROR_LABELS))
+        return sd if ctx_indices is None else sd[ctx_indices]
+    intercept_var = np.square(stdevs["intercept_logits"].detach().cpu().numpy())
+    base_sd = stdevs["base_logits"].detach().cpu().numpy()
+    bm = _context_base_matrix(context_length, base_sd.shape[1], ctx_indices)
+    var = np.broadcast_to(intercept_var, (bm.shape[0], len(ERROR_LABELS))).copy()
+    for pos in range(context_length):
+        var += np.square(base_sd[pos, bm[:, pos], :])
+    return np.sqrt(np.maximum(var, 0))
+
+
+def _center(logits: np.ndarray, sd: np.ndarray | None = None):
+    c = logits - logits.mean(axis=-1, keepdims=True)
+    if sd is None:
+        return c, None
+    n = sd.shape[-1]
+    var = np.square(sd)
+    cvar = var * (1 - 2 / n) + var.sum(axis=-1, keepdims=True) / n ** 2
+    return c, np.sqrt(np.maximum(cvar, 0))
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    s = x - x.max(axis=-1, keepdims=True)
+    e = np.exp(s)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _derive_category_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add error_type_group and nearest_base; leave context_distance as NA."""
+    df = df.copy()
+    if "error_type" in df.columns:
+        df["error_type_group"] = df["error_type"].map(_ERROR_GROUP).fillna("other")
+    if "context" in df.columns:
+        df["nearest_base"] = df["context"].str[-1:].where(df["context"].str.len() > 0, other=pd.NA)
+    if "context_distance" not in df.columns:
+        df["context_distance"] = pd.NA
+    if "context_base" not in df.columns:
+        df["context_base"] = pd.NA
+    return df
+
+
+def extract_composed_params(name: str, artifact: dict, max_contexts: int = 50_000) -> pd.DataFrame:
+    """Return per-(context, error_type) VI parameter rows from one artifact.
+
+    When 4^context_length exceeds max_contexts, a random sample of context
+    indices is drawn so that arrays of that size are never materialised.
+    """
+    context_length = int(artifact.get("context_length", 0))
+    vi = artifact.get("variational_inference", {})
+    means = vi.get("params_mean", {})
+    stdevs = vi.get("params_stdev", {})
+
+    has_mean = "logits" in means or "intercept_logits" in means
+    has_sd = "logits" in stdevs or "intercept_logits" in stdevs
+    if not has_mean or not has_sd:
+        return pd.DataFrame()
+
+    base_labels = _base_labels_for_params(means, context_length)
+    n_ctx_total = len(base_labels) ** context_length
+
+    if n_ctx_total > max_contexts:
+        ctx_indices = np.sort(np.random.default_rng(42).choice(n_ctx_total, size=max_contexts, replace=False))
+    else:
+        ctx_indices = None  # use all
+
+    mean_logits = _compose_logits(means, context_length, ctx_indices)
+    sd_logits = _compose_logit_sd(stdevs, context_length, ctx_indices)
+    c_mean, c_sd = _center(mean_logits, sd_logits)
+    probs = _softmax(mean_logits)
+
+    n_ctx, n_err = c_mean.shape
+    # Vectorised z / p-value computation — avoids a Python loop over 4^N × E rows
+    z = np.where(c_sd > 0, c_mean / c_sd, np.nan)
+    p = np.where(np.isfinite(z), 2.0 * stats.norm.sf(np.abs(z)), np.nan)
+    mlp = np.where(p > 0, -np.log10(p), np.nan)
+
+    ctx_iter = ctx_indices if ctx_indices is not None else range(n_ctx_total)
+    ctx_strs = [_decode_context(int(i), context_length, base_labels) for i in ctx_iter]
+    df = pd.DataFrame({
+        "artifact":            name,
+        "platform":            artifact.get("platform", ""),
+        "model_id":            get_model_id(artifact),
+        "model_type":          get_model_type(artifact),
+        "context_length":      context_length,
+        "context_index":       np.repeat(np.arange(n_ctx), n_err),
+        "context":             np.repeat(ctx_strs, n_err),
+        "error_type":          np.tile(list(ERROR_LABELS), n_ctx),
+        "centered_logit_mean": c_mean.ravel(),
+        "centered_logit_sd":   c_sd.ravel(),
+        "ci_low":              (c_mean - 1.96 * c_sd).ravel(),
+        "ci_high":             (c_mean + 1.96 * c_sd).ravel(),
+        "z":                   z.ravel(),
+        "p_value":             p.ravel(),
+        "minus_log10_p":       mlp.ravel(),
+        "probability_mean":    probs.ravel(),
+    })
+    return _derive_category_columns(df)
+
+
+def extract_position_params(name: str, artifact: dict) -> pd.DataFrame:
+    """Return per-(position, base, error_type) parameter rows for additive models.
+
+    Returns an empty DataFrame for any model type that does not expose
+    explicit position-level parameters (e.g. full-context or future types
+    that store position effects under different key names).
+    """
+    if get_model_type(artifact) != "additive_context":
+        return pd.DataFrame()
+
+    context_length = int(artifact.get("context_length", 0))
+    vi = artifact.get("variational_inference", {})
+    means = vi.get("params_mean", {})
+    stdevs = vi.get("params_stdev", {})
+
+    if "base_logits" not in means or "base_logits" not in stdevs:
+        return pd.DataFrame()
+
+    m = means["base_logits"].detach().cpu().numpy()   # [L, B, E]
+    s = stdevs["base_logits"].detach().cpu().numpy()  # [L, B, E]
+    # Center over bases (same transformation as the model applies at run time)
+    c_m = m - m.mean(axis=1, keepdims=True)
+    c_s = s  # SD unchanged by the mean-subtraction of the mean
+
+    base_labels = LEGACY_BASES[: m.shape[1]]
+    n_pos, n_base, n_err = c_m.shape
+    # Vectorised z / p-value computation over all (position, base, error) triples
+    z = np.where(c_s > 0, c_m / c_s, np.nan)
+    p = np.where(np.isfinite(z), 2.0 * stats.norm.sf(np.abs(z)), np.nan)
+    mlp = np.where(p > 0, -np.log10(p), np.nan)
+
+    distances = np.array([context_length - pos for pos in range(n_pos)])  # [L]
+    dist_rep  = np.repeat(np.repeat(distances, n_base), n_err)             # [L*B*E]
+    base_rep  = np.tile(np.repeat(list(base_labels), n_err), n_pos)       # [L*B*E]
+    err_rep   = np.tile(list(ERROR_LABELS), n_pos * n_base)               # [L*B*E]
+
+    df = pd.DataFrame({
+        "artifact":        name,
+        "platform":        artifact.get("platform", ""),
+        "model_id":        get_model_id(artifact),
+        "model_type":      "additive_context",
+        "context_length":  context_length,
+        "context_distance": dist_rep,
+        "context_base":    base_rep,
+        "error_type":      err_rep,
+        "error_type_group": [_ERROR_GROUP.get(e, "other") for e in err_rep],
+        "nearest_base":    pd.NA,
+        "base_logit_mean": c_m.ravel(),
+        "base_logit_sd":   c_s.ravel(),
+        "z":               z.ravel(),
+        "p_value":         p.ravel(),
+        "minus_log10_p":   mlp.ravel(),
+    })
+    return df
+
+
+def _resolve_prefix_path(prefix: str | Path) -> Path:
+    """Resolve artifact data prefixes relative to the report and results root."""
+    path = Path(prefix).expanduser()
+    if path.is_absolute():
+        return path
+    candidates = [
+        (RESULTS_DIR.parent / path).resolve(),
+        path.resolve(),
+    ]
+    for candidate in candidates:
+        if candidate.with_suffix(".summary_phred.csv").exists():
+            return candidate
+    return candidates[0]
+
+
+def load_quality_summary_rows(name: str, artifact: dict) -> pd.DataFrame:
+    """Return summary_phred rows referenced by one model artifact."""
+    rows = []
+    prefix_sets = [
+        ("train", artifact.get("train_prefixes", [])),
+        ("test", artifact.get("test_prefixes", [])),
+    ]
+    for split, prefixes in prefix_sets:
+        for prefix in prefixes:
+            resolved = _resolve_prefix_path(prefix)
+            path = resolved.with_suffix(".summary_phred.csv")
+            if not path.exists():
+                continue
+            data = pd.read_csv(path)
+            required = {"qscore", "num_correct", "num_error", "error_rate"}
+            if not required.issubset(data.columns):
+                continue
+            data = data.copy()
+            data["artifact"] = name
+            data["platform"] = artifact.get("platform", "")
+            data["model_id"] = get_model_id(artifact)
+            data["model_type"] = get_model_type(artifact)
+            data["split"] = split
+            data["source_prefix"] = str(resolved)
+            rows.append(data)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
+# ── Aggregate across all loaded artifacts ──────────────────────────────────────
+_composed_chunks = [
+    extract_composed_params(name, art)
+    for name, art in artifacts.items()
+]
+composed_params = pd.concat([df for df in _composed_chunks if not df.empty], ignore_index=True)
+del _composed_chunks
+
+_position_chunks = [
+    extract_position_params(name, art)
+    for name, art in artifacts.items()
+]
+position_params = pd.concat([df for df in _position_chunks if not df.empty], ignore_index=True)
+del _position_chunks
+
+_quality_chunks = [
+    load_quality_summary_rows(name, art)
+    for name, art in artifacts.items()
+]
+quality_summary = pd.concat(
+    [df for df in _quality_chunks if not df.empty],
+    ignore_index=True,
+) if any(not df.empty for df in _quality_chunks) else pd.DataFrame()
+del _quality_chunks
+
+# Free PyTorch tensor memory — all data is now in numpy/pandas
+del artifacts, _raw_artifacts
+import gc; gc.collect()
+
+print(f"Composed parameter rows: {len(composed_params):,}")
+print(f"Position parameter rows:  {len(position_params):,}")
+print(f"Quality summary rows:     {len(quality_summary):,}")
+```
+
+## Visualisation Helpers
+
+```{python}
+#| code-fold: true
+#| code-summary: "Heatmap and volcano helper functions"
+_CLUSTER_ROW_LIMIT = 80  # rows above this fall back to natural order (O(n²) clustering too slow)
+
+def _ward_order(df: pd.DataFrame) -> tuple[list, list]:
+    mat = df.to_numpy(dtype=float)
+    finite = mat[np.isfinite(mat)]
+    fill = float(np.nanmedian(finite)) if finite.size else 0.0
+    mat = np.nan_to_num(mat, nan=fill, posinf=fill, neginf=fill)
+    if mat.shape[0] > 1 and mat.shape[0] <= _CLUSTER_ROW_LIMIT:
+        row_ord = leaves_list(linkage(mat, method="ward")).tolist()
+    else:
+        row_ord = list(range(mat.shape[0]))  # keep pre-sorted order for large matrices
+    col_ord = leaves_list(linkage(mat.T, method="ward")).tolist() if mat.shape[1] > 1 else list(range(mat.shape[1]))
+    return [df.index[i] for i in row_ord], [df.columns[i] for i in col_ord]
+
+
+def _log_heatmap_scale(probs: pd.DataFrame, exclude=("match",)):
+    scale = probs.drop(columns=[c for c in exclude if c in probs], errors="ignore")
+    pos = scale.to_numpy(dtype=float)
+    pos = pos[pos > 0]
+    if pos.size == 0:
+        zmin, zmax, floor = -12.0, 0.0, -13.0
+    else:
+        zmin, zmax = float(np.log10(pos.min())), float(np.log10(pos.max()))
+        floor = float(np.floor(zmin)) - 1
+    log_vals = np.log10(np.clip(probs.to_numpy(dtype=float), 10 ** floor, None))
+    return log_vals, zmin, zmax, floor
+
+
+def make_probability_heatmap(
+    subset: pd.DataFrame,
+    *,
+    model_id: str,
+    platform: str,
+    context_length: int,
+    sample_size: int = 500,
+    max_contexts: int = 80,
+) -> go.Figure | None:
+    """Return a log-probability heatmap for a single (model, platform) pair."""
+    ctx_vals = subset["context"].drop_duplicates()
+    n = min(sample_size, len(ctx_vals))
+    ctx_order = ctx_vals.sample(n=n, random_state=42).sort_values().tolist()
+    hdf = subset[subset["context"].isin(ctx_order)].pivot(
+        index="context", columns="error_type", values="probability_mean"
+    )
+    # Ensure canonical column order
+    hdf = hdf.reindex(columns=[c for c in ERROR_LABELS if c in hdf.columns])
+    hdf = hdf.loc[ctx_order]
+    if hdf.empty:
+        return None
+
+    log_vals, zmin, zmax, _ = _log_heatmap_scale(hdf)
+    log_df = pd.DataFrame(log_vals, index=hdf.index, columns=hdf.columns)
+    row_ord, col_ord = _ward_order(log_df)
+    hdf, log_df = hdf.loc[row_ord, col_ord], log_df.loc[row_ord, col_ord]
+
+    fig = go.Figure(go.Heatmap(
+        z=log_df.to_numpy(), x=list(log_df.columns), y=list(log_df.index),
+        customdata=hdf.to_numpy(), colorscale="BuPu", zmin=zmin, zmax=zmax,
+        colorbar={"title": "log₁₀(p)"},
+        hovertemplate="context=%{y}<br>error=%{x}<br>p=%{customdata:.4g}<br>log₁₀(p)=%{z:.3f}<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_white",
+        title=f"{platform} / {model_id} — error probabilities (n={len(hdf)} contexts)",
+        xaxis_title="Error type", yaxis_title="Context",
+        height=max(400, min(1200, 16 * len(hdf))),
+    )
+    return fig
+
+
+def make_position_heatmap(
+    subset: pd.DataFrame,
+    *,
+    model_id: str,
+    platform: str,
+) -> go.Figure | None:
+    """Return a (distance × base) × error_type heatmap of additive logit effects.
+
+    Each cell is a direct base_logits parameter, with sign preserved and a
+    diverging colour scale centred at zero.
+    """
+    df = subset.copy()
+    df["distance_base"] = (
+        df["context_distance"].astype(str) + ":" + df["context_base"].astype(str)
+    )
+    hdf = df.pivot_table(
+        index="distance_base", columns="error_type",
+        values="base_logit_mean", aggfunc="mean",
+    )
+    hdf = hdf.reindex(columns=[c for c in ERROR_LABELS if c in hdf.columns])
+    # Sort rows: distance descending, then base alphabetically within distance
+    hdf = hdf.sort_index(key=lambda idx: pd.MultiIndex.from_tuples(
+        [(-int(s.split(":")[0]), s.split(":")[1]) for s in idx]
+    ))
+    if hdf.empty:
+        return None
+
+    vals = hdf.to_numpy(dtype=float)
+    abs_max = float(np.nanmax(np.abs(vals)))
+    if abs_max == 0:
+        abs_max = 1.0
+
+    _, col_ord = _ward_order(pd.DataFrame(vals, index=hdf.index, columns=hdf.columns))
+    hdf = hdf[col_ord]
+
+    fig = go.Figure(go.Heatmap(
+        z=hdf.to_numpy(), x=list(hdf.columns), y=list(hdf.index),
+        colorscale="RdBu", zmid=0, zmin=-abs_max, zmax=abs_max,
+        colorbar={"title": "logit effect"},
+        hovertemplate=(
+            "distance:base=%{y}<br>error=%{x}<br>"
+            "logit effect=%{z:.4f}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        template="plotly_white",
+        title=f"{platform} / {model_id} — additive base effects (distance × base × error)",
+        xaxis_title="Error type",
+        yaxis_title="Distance : base",
+        height=max(360, 28 * len(hdf)),
+    )
+    return fig
+
+
+def make_category_volcano(
+    df: pd.DataFrame,
+    *,
+    x_col: str,
+    y_col: str,
+    hover_cols: list[str],
+    categories: list[ParameterCategory],
+    title: str,
+    default_category: str | None = None,
+    max_points: int = 50_000,
+) -> go.Figure | None:
+    """Return a Plotly volcano with a dropdown to switch colour category.
+
+    Uses a single data trace whose marker.color is swapped via restyle, plus
+    invisible 1-point dummy traces for the legend.  This avoids duplicating
+    the (x, y, customdata) arrays once per (category × unique-value) combination,
+    which would otherwise multiply HTML size by ~n_traces.
+
+    Categories whose column is absent or fully NA are omitted from the dropdown.
+    """
+    if df.empty:
+        return None
+
+    # Downsample when needed, keeping the most significant points
+    if len(df) > max_points:
+        n_top = min(len(df), max_points // 5)
+        top = df.nsmallest(n_top, "p_value") if "p_value" in df.columns else df.head(n_top)
+        rest = df.drop(index=top.index)
+        n_rest = max(0, max_points - len(top))
+        rest = rest.sample(n=min(n_rest, len(rest)), random_state=42) if n_rest > 0 and not rest.empty else pd.DataFrame()
+        df = pd.concat([top, rest], ignore_index=True)
+
+    available = [
+        c for c in categories
+        if c.column in df.columns and df[c.column].notna().any()
+    ]
+    if not available:
+        return None
+
+    default_idx = next(
+        (i for i, c in enumerate(available) if c.key == default_category),
+        0,
+    )
+
+    ScatterCls = go.Scattergl if len(df) > 5_000 else go.Scatter
+    _hcols = [c for c in hover_cols if c in df.columns]
+    custom = df[_hcols].values if _hcols else None
+    htmpl = (
+        "<br>".join(f"{c}=%{{customdata[{i}]}}" for i, c in enumerate(_hcols))
+        + "<extra></extra>"
+    ) if _hcols else "<extra></extra>"
+
+    # Pre-compute per-category color arrays and unique-value info
+    cat_info: list[tuple] = []  # (unique_vals, colormap, color_array_per_point, cat)
+    for cat in available:
+        vals = df[cat.column].fillna("NA").astype(str)
+        unique_vals = sorted(vals.unique())
+        colormap = {v: cat.colors[i % len(cat.colors)] for i, v in enumerate(unique_vals)}
+        color_array = [colormap[v] for v in vals]
+        cat_info.append((unique_vals, colormap, color_array, cat))
+
+    init_unique_vals, init_colormap, init_colors, init_cat = cat_info[default_idx]
+
+    # Trace 0: one data trace — x/y/customdata stored only once
+    traces: list = [ScatterCls(
+        x=df[x_col], y=df[y_col],
+        mode="markers",
+        name="",
+        marker=dict(color=init_colors, size=4, opacity=0.55),
+        customdata=custom,
+        hovertemplate=htmpl,
+        showlegend=False,
+    )]
+
+    # Traces 1+: invisible 1-point dummy traces for the legend
+    for cat_i, (unique_vals, colormap, _, cat) in enumerate(cat_info):
+        is_default = cat_i == default_idx
+        for val in unique_vals:
+            traces.append(ScatterCls(
+                x=[None], y=[None],
+                mode="markers",
+                name=val,
+                marker=dict(color=colormap[val], size=8),
+                visible=is_default,
+                showlegend=is_default,
+                legendgroup=f"{cat.key}_{val}",
+            ))
+
+    fig = go.Figure(data=traces)
+
+    # Dropdown buttons: restyle trace 0's color array + toggle dummy trace visibility.
+    # Plotly restyle applies each list element to the trace at that index; providing
+    # a list shorter than n_traces updates only those traces and leaves the rest alone.
+    # So [color_array] updates only trace 0, while visible/showlegend cover all traces.
+    buttons = []
+    for cat_i, (unique_vals, colormap, color_array, cat) in enumerate(cat_info):
+        visible = [True]  # trace 0 always visible
+        showlegend = [False]  # trace 0 never in legend
+        for ci, (u_vals, _, _, _) in enumerate(cat_info):
+            is_active = ci == cat_i
+            visible.extend([is_active] * len(u_vals))
+            showlegend.extend([is_active] * len(u_vals))
+
+        buttons.append(dict(
+            label=cat.label,
+            method="update",
+            args=[
+                {
+                    "marker.color": [color_array],   # updates trace 0 only
+                    "visible": visible,
+                    "showlegend": showlegend,
+                },
+                {"title.text": f"{title}<br><sup>Colour: {cat.description}</sup>"},
+            ],
+        ))
+
+    first_cat = cat_info[default_idx][3]
+    fig.update_layout(
+        title=f"{title}<br><sup>Colour: {first_cat.description}</sup>",
+        xaxis_title=x_col.replace("_", " "),
+        yaxis_title="−log₁₀(p)" if "log10_p" in y_col else y_col.replace("_", " "),
+        template="plotly_white",
+        height=520,
+        updatemenus=[dict(
+            type="dropdown", direction="down",
+            x=0.0, xanchor="left", y=1.16, yanchor="top",
+            buttons=buttons, active=default_idx,
+            bgcolor="white", bordercolor="#cccccc",
+        )],
+        annotations=[dict(
+            text="<b>Colour by:</b>", x=0.0, xref="paper",
+            y=1.19, yref="paper", showarrow=False, font=dict(size=11),
+        )],
+        legend_title_text=first_cat.label,
+    )
+    fig.add_vline(x=0, line_color="#333333", line_width=1, line_dash="dot")
+    return fig
+
+
+def rgba(hex_colour: str, alpha: float) -> str:
+    hex_colour = hex_colour.lstrip("#")
+    red = int(hex_colour[0:2], 16)
+    green = int(hex_colour[2:4], 16)
+    blue = int(hex_colour[4:6], 16)
+    return f"rgba({red},{green},{blue},{alpha})"
+
+
+def bootstrap_loglinear_curve(
+    q_values,
+    totals,
+    errors,
+    q_grid,
+    *,
+    n_boot: int = 500,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return parametric-bootstrap 95% bands for a log-linear qcal curve."""
+    q_values = np.asarray(q_values, dtype=float)
+    totals = np.asarray(totals, dtype=float)
+    errors = np.asarray(errors, dtype=float)
+    q_grid = np.asarray(q_grid, dtype=float)
+    mask = totals > 0
+    q_values = q_values[mask]
+    totals = totals[mask]
+    errors = errors[mask]
+    if len(q_values) < 2:
+        return np.full_like(q_grid, np.nan, dtype=float), np.full_like(q_grid, np.nan, dtype=float)
+
+    rng = np.random.default_rng(seed)
+    p_hat = (errors + 0.5) / (totals + 1.0)
+    weights = np.sqrt(totals)
+    curves = np.empty((n_boot, len(q_grid)), dtype=float)
+    for idx in range(n_boot):
+        sampled_errors = rng.binomial(totals.astype(int), p_hat)
+        sampled_rate = (sampled_errors + 0.5) / (totals + 1.0)
+        slope, intercept = np.polyfit(
+            q_values,
+            np.log10(np.clip(sampled_rate, 1e-12, 1.0)),
+            deg=1,
+            w=weights,
+        )
+        curves[idx] = 10 ** (intercept + slope * q_grid)
+    return np.quantile(curves, [0.025, 0.975], axis=0)
+
+
+def wilson_interval(errors, totals, z: float = 1.96):
+    errors = np.asarray(errors, dtype=float)
+    totals = np.asarray(totals, dtype=float)
+    p = np.divide(errors, totals, out=np.zeros_like(errors), where=totals > 0)
+    denom = 1.0 + z**2 / np.maximum(totals, 1.0)
+    centre = (p + z**2 / (2.0 * np.maximum(totals, 1.0))) / denom
+    half_width = (
+        z
+        * np.sqrt(
+            (p * (1.0 - p) / np.maximum(totals, 1.0))
+            + z**2 / (4.0 * np.maximum(totals, 1.0) ** 2)
+        )
+        / denom
+    )
+    low = np.where(totals > 0, np.maximum(0.0, centre - half_width), np.nan)
+    high = np.where(totals > 0, np.minimum(1.0, centre + half_width), np.nan)
+    return low, high
+
+
+def _quality_curve_tables(summary: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return empirical quality points and log-linear fit curves with bootstrap bands."""
+    if summary.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    grouped = (
+        summary.groupby(["platform", "split", "qscore"], as_index=False)
+        .agg(num_correct=("num_correct", "sum"), num_error=("num_error", "sum"))
+    )
+    grouped["n"] = grouped["num_correct"] + grouped["num_error"]
+    grouped["error_rate"] = grouped["num_error"] / grouped["n"]
+    low, high = wilson_interval(grouped["num_error"], grouped["n"])
+    grouped["ci_low"] = low
+    grouped["ci_high"] = high
+    grouped["err_plus"] = grouped["ci_high"] - grouped["error_rate"]
+    grouped["err_minus"] = grouped["error_rate"] - grouped["ci_low"]
+
+    fit_rows = []
+    q_grid = np.arange(int(grouped["qscore"].min()), int(grouped["qscore"].max()) + 1)
+    for (platform, split), sub in grouped.groupby(["platform", "split"], sort=False):
+        use = sub[(sub["n"] > 0) & (sub["error_rate"] > 0)]
+        if len(use) < 2:
+            continue
+        ci_low, ci_high = bootstrap_loglinear_curve(
+            use["qscore"],
+            use["n"],
+            use["num_error"],
+            q_grid,
+            seed=42 + sum(ord(char) for char in f"{platform}:{split}"),
+        )
+        slope, intercept = np.polyfit(
+            use["qscore"].astype(float),
+            np.log10(use["error_rate"].astype(float)),
+            deg=1,
+            w=np.sqrt(use["n"].astype(float)),
+        )
+        for q in q_grid:
+            fit_rows.append(
+                {
+                    "platform": platform,
+                    "split": split,
+                    "qscore": q,
+                    "fitted_error_rate": float(10 ** (intercept + slope * q)),
+                    "ci_low": float(ci_low[np.where(q_grid == q)[0][0]]),
+                    "ci_high": float(ci_high[np.where(q_grid == q)[0][0]]),
+                    "qcal_intercept": float(intercept),
+                    "qcal_slope": float(slope),
+                }
+            )
+    return grouped, pd.DataFrame(fit_rows)
+```
+
+## Quality-Score Calibration
+
+```{python}
+#| label: fig-platform-qcal
+#| fig-cap: "Per-platform empirical quality-score calibration with bootstrap 95% confidence bands and log-linear fits."
+#| fig-alt: "Quality score versus empirical error rate, with shaded bootstrap confidence bands around log-linear fitted curves."
+quality_points, quality_fits = _quality_curve_tables(quality_summary)
+if quality_points.empty or quality_fits.empty:
+    display(Markdown("> No `summary_phred.csv` files were available for quality-score calibration plots."))
+else:
+    fig = go.Figure()
+    palette = px.colors.qualitative.Plotly
+    for idx, ((platform, split), sub) in enumerate(
+        quality_fits.groupby(["platform", "split"], sort=False)
+    ):
+        colour = palette[idx % len(palette)]
+        fig.add_trace(go.Scatter(
+            x=pd.concat([sub["qscore"], sub["qscore"][::-1]]),
+            y=pd.concat([sub["ci_high"], sub["ci_low"][::-1]]),
+            fill="toself",
+            fillcolor=rgba(colour, 0.18),
+            line={"color": rgba(colour, 0.0), "width": 0},
+            hoverinfo="skip",
+            name=f"{platform} {split} bootstrap 95% band",
+            showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=sub["qscore"],
+            y=sub["fitted_error_rate"],
+            mode="lines",
+            name=f"{platform} {split} log-linear fit",
+            line={"color": colour},
+            hovertemplate=(
+                f"platform={platform}<br>split={split}<br>Q=%{{x}}<br>"
+                "fitted p(error)=%{y:.6g}<extra></extra>"
+            ),
+        ))
+    for (platform, split), sub in quality_points.groupby(["platform", "split"], sort=False):
+        custom = np.stack(
+            [sub["n"], sub["num_error"], sub["ci_low"], sub["ci_high"]],
+            axis=1,
+        )
+        fig.add_trace(go.Scatter(
+            x=sub["qscore"],
+            y=sub["error_rate"],
+            mode="markers",
+            name=f"{platform} {split} empirical points",
+            customdata=custom,
+            hovertemplate=(
+                f"platform={platform}<br>split={split}<br>Q=%{{x}}<br>"
+                "empirical p(error)=%{y:.6g}<br>"
+                "n=%{customdata[0]:.0f}<br>errors=%{customdata[1]:.0f}<br>"
+                "95% CI=[%{customdata[2]:.6g}, %{customdata[3]:.6g}]"
+                "<extra></extra>"
+            ),
+        ))
+    fig.update_layout(
+        template="plotly_white",
+        title="Quality-score calibration: empirical points and log-linear fits",
+        xaxis_title="Phred score",
+        yaxis_title="P(error | Q)",
+    )
+    fig.update_yaxes(type="log")
+    fig.show()
+```
+
+```{python}
+#| label: fig-platform-qcal-params
+#| fig-cap: "Log-linear quality calibration parameters fitted from summary_phred.csv."
+#| fig-alt: "Bar chart of log-linear intercept and slope parameters by platform and split."
+if quality_fits.empty:
+    print("No log-linear quality calibration parameters were fitted.")
+else:
+    qparams = (
+        quality_fits[
+            ["platform", "split", "qcal_intercept", "qcal_slope"]
+        ]
+        .drop_duplicates()
+        .melt(
+            id_vars=["platform", "split"],
+            value_vars=["qcal_intercept", "qcal_slope"],
+            var_name="parameter",
+            value_name="value",
+        )
+    )
+    fig = px.bar(
+        qparams,
+        x="parameter",
+        y="value",
+        color="split",
+        facet_col="platform" if PLATFORM == "all" else None,
+        barmode="group",
+        hover_data={"value": ":.6g"},
+        title="Log-linear quality calibration parameters",
+        template="plotly_white",
+    )
+    fig.update_layout(xaxis_title="", yaxis_title="Parameter value")
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fig.show()
+```
+
+## Per-Model Parameter Analysis
+
+```{python}
+#| echo: false
+if not SHOW_PER_MODEL_PLOTS or composed_params.empty:
+    display(Markdown(
+        "> Per-model parameter plots are disabled. "
+        "Set `show_per_model_plots: true` in the report params "
+        "or render with `-P show_per_model_plots:true` to enable them."
+        if not SHOW_PER_MODEL_PLOTS
+        else "> No parameter rows were extracted from the loaded artifacts."
+    ))
+```
+
+```{python}
+#| echo: false
+if SHOW_PER_MODEL_PLOTS and not composed_params.empty:
+    _composed_hover = [
+        "platform", "model_id", "model_type", "context",
+        "error_type", "centered_logit_sd", "p_value", "probability_mean",
+    ]
+    _position_hover = [
+        "platform", "model_id", "context_distance", "context_base",
+        "error_type", "base_logit_sd", "p_value",
+    ]
+
+    # Iterate over unique (platform, model_id) combinations in a stable order
+    _model_keys = (
+        composed_params[["platform", "model_id", "model_type", "context_length"]]
+        .drop_duplicates()
+        .sort_values(["platform", "model_type", "context_length"])
+        .itertuples(index=False)
+    )
+
+    for _row in _model_keys:
+        _plt, _mid, _mtype, _clen = _row.platform, _row.model_id, _row.model_type, _row.context_length
+
+        # ── Section heading ────────────────────────────────────────────────────
+        display(Markdown(
+            f"\n### {_plt} / {_mid}\n\n"
+            f"**Type:** `{_mtype}` &nbsp;|&nbsp; **Context length:** {_clen}"
+        ))
+
+        # ── Subset this (platform, model_id) ──────────────────────────────────
+        _csub = composed_params[
+            (composed_params["platform"] == _plt) &
+            (composed_params["model_id"] == _mid)
+        ]
+        _psub = position_params[
+            (position_params["platform"] == _plt) &
+            (position_params["model_id"] == _mid)
+        ] if not position_params.empty else pd.DataFrame()
+
+        if _mtype == "additive_context":
+            # Direct parameters: base_logits[distance, base, error_type]
+            # Each cell in the heatmap and each point in the volcano is one parameter.
+            if not _psub.empty:
+                _pfig = make_position_heatmap(_psub, model_id=_mid, platform=_plt)
+                if _pfig is not None:
+                    _pfig.show()
+                    del _pfig
+
+                _pvfig = make_category_volcano(
+                    _psub,
+                    x_col="base_logit_mean",
+                    y_col="minus_log10_p",
+                    hover_cols=_position_hover,
+                    categories=PARAMETER_CATEGORIES,
+                    title=f"{_plt} / {_mid} — additive base-effect parameters",
+                    default_category="context_distance",
+                    max_points=MAX_VOLCANO_POINTS,
+                )
+                if _pvfig is not None:
+                    _pvfig.show()
+                    del _pvfig
+
+        else:
+            # combinatorial_context: logits[context_index, error_type] are direct parameters.
+            # Each context string × error_type cell is an independently learned logit.
+            if _clen <= MAX_HEATMAP_CONTEXTS:
+                _hfig = make_probability_heatmap(
+                    _csub,
+                    model_id=_mid,
+                    platform=_plt,
+                    context_length=_clen,
+                    sample_size=HEATMAP_CONTEXT_SAMPLE,
+                    max_contexts=MAX_HEATMAP_CONTEXTS,
+                )
+                if _hfig is not None:
+                    _hfig.show()
+                    del _hfig
+
+            _vfig = make_category_volcano(
+                _csub,
+                x_col="centered_logit_mean",
+                y_col="minus_log10_p",
+                hover_cols=_composed_hover,
+                categories=PARAMETER_CATEGORIES,
+                title=f"{_plt} / {_mid} — context parameter volcano",
+                default_category="error_type_group",
+                max_points=MAX_VOLCANO_POINTS,
+            )
+            if _vfig is not None:
+                _vfig.show()
+                del _vfig
+```
+
+## P-Value Summary
+
+```{python}
+#| label: fig-pvalue-dist
+#| fig-cap: "Distribution of p-values for centered logits under a mean-zero null."
+#| fig-alt: "Histograms of p-values faceted by model type and model ID."
+if composed_params.empty:
+    print("No parameter rows available for p-value summary.")
+else:
+    _bins = np.linspace(0, 1, 41)
+    _density_rows = []
+    _group_cols = ["platform", "model_id", "model_type"]
+    for _key, _sub in composed_params.groupby(_group_cols, sort=False):
+        _plt, _mid, _mtype = _key
+        _counts, _edges = np.histogram(_sub["p_value"].dropna(), bins=_bins)
+        _widths = np.diff(_edges)
+        _density = _counts / max(1, _counts.sum()) / _widths
+        _centers = _edges[:-1] + _widths / 2
+        _density_rows.append(pd.DataFrame({
+            "platform": _plt, "model_id": _mid, "model_type": _mtype,
+            "p_value_bin": _centers, "density": _density, "count": _counts,
+        }))
+    _pval_density = pd.concat(_density_rows, ignore_index=True)
+
+    _facet_col = "model_type" if PLATFORM == "all" else None
+    _color_col = "platform" if PLATFORM == "all" else "model_id"
+    fig = px.bar(
+        _pval_density,
+        x="p_value_bin", y="density",
+        color=_color_col,
+        facet_col=_facet_col,
+        facet_row="model_type" if PLATFORM != "all" else None,
+        facet_row_spacing=0.04,
+        hover_data=["count", "model_id", "platform"],
+        title="Centered-logit p-values (mean-zero null)",
+    )
+    fig.update_layout(
+        xaxis_title="p-value", yaxis_title="Density",
+        template="plotly_white", bargap=0.02,
+        height=max(450, 220 * _pval_density["model_type"].nunique()),
+    )
+    fig.update_yaxes(matches=None)
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fig.show()
+```
+
+## Interpretation Notes
+
+- **Test NLL per base** — lower values indicate better held-out compression of
+  the error distribution; the log scale makes small differences at low error
+  rates visible.
+- **AIC** — penalises model complexity; lower is better.  Additive-context models
+  use far fewer parameters than full-context models at the same context length,
+  so their AIC curves often intersect at moderate lengths.
+- **Parameter volcano** — each point is one (context, error type) parameter.
+  Horizontal axis: centered logit mean (positive = more likely than average for
+  this context; negative = less likely). Vertical axis: −log₁₀(p) from a
+  Wald test against a mean-zero null using the variational posterior SD.
+- **Position volcano** — each point is one additive position × base × error
+  contribution from an `additive_context` model.  The horizontal axis shows
+  the base-level logit centred over nucleotides at that position.
+- **Category dropdown** — use the *Colour by* menu on each volcano to switch
+  between colourings.  Categories whose column is absent or all-NA for a
+  given model are omitted from the menu automatically.
+- **Extending to new model types** — add a `ParameterCategory` entry to
+  `PARAMETER_CATEGORIES` above and populate the corresponding column in the
+  extraction functions (`extract_composed_params`, `extract_position_params`,
+  or a new function for structurally different parameter sets such as
+  homopolymer run-length slopes or HMM latent-state emission tables).

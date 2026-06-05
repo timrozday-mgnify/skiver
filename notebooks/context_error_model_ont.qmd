@@ -1,0 +1,59 @@
+---
+title: "Context Error Model: ONT"
+jupyter: skiver
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  execute-dir: file
+params:
+  results_dir: "../context_error_models"
+  platform: "ont"
+  artifact_glob: "*.pt"
+  max_volcano_points: 50000
+  top_parameters: 80
+  max_heatmap_contexts: 80
+  heatmap_context_sample: 500
+  show_per_model_plots: true
+---
+
+Context-dependent error model results for the **ont** (Oxford Nanopore) platform.
+
+```{python}
+#| echo: false
+from pathlib import Path
+import os
+
+PARAMS = globals().get("params", {
+    "results_dir": "../context_error_models",
+    "platform": "ont",
+    "artifact_glob": "*.pt",
+    "max_volcano_points": 50000,
+    "top_parameters": 80,
+    "max_heatmap_contexts": 80,
+    "heatmap_context_sample": 500,
+    "show_per_model_plots": True,
+})
+
+RESULTS_DIR = Path(PARAMS.get("results_dir", "../context_error_models")).expanduser()
+PLATFORM = str(PARAMS.get("platform", "ont"))
+ARTIFACT_GLOB = str(PARAMS.get("artifact_glob", "*.pt"))
+MAX_VOLCANO_POINTS = int(PARAMS.get("max_volcano_points", 50000))
+TOP_PARAMETERS = int(PARAMS.get("top_parameters", 80))
+MAX_HEATMAP_CONTEXTS = int(PARAMS.get("max_heatmap_contexts", 80))
+HEATMAP_CONTEXT_SAMPLE = int(PARAMS.get("heatmap_context_sample", 500))
+SHOW_PER_MODEL_PLOTS = str(PARAMS.get("show_per_model_plots", True)).lower() not in ("false", "0", "no")
+
+print(f"Results directory : {RESULTS_DIR.resolve()}")
+print(f"Platform filter   : {PLATFORM}")
+print(f"Per-model plots   : {SHOW_PER_MODEL_PLOTS}")
+```
+
+{{< include _context_error_model_body.qmd >}}

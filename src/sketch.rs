@@ -1,15 +1,15 @@
-
-
+use crate::cmdline::SketchArgs;
 use crate::kvmer::*;
 use crate::utils::estimate_c_from_raw_files;
+use log::{error, info};
 use simple_logger::SimpleLogger;
-use log::{info, error};
-use crate::cmdline::SketchArgs;
 //use rayon::prelude::*;
 
-
 pub fn sketch(args: SketchArgs) {
-    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
 
     // check if the output file is valid
     if args.output_path.is_empty() {
@@ -31,7 +31,10 @@ pub fn sketch(args: SketchArgs) {
     let c = args.c.unwrap_or_else(|| {
         let raw_refs: Vec<&str> = args.files.iter().map(|s| s.as_str()).collect();
         let (auto_c, est_file_size) = estimate_c_from_raw_files(&raw_refs);
-        info!("Total estimated input sequence file size (decompressed): {:.2} GB", est_file_size as f64 / (1024.0 * 1024.0 * 1024.0));
+        info!(
+            "Total estimated input sequence file size (decompressed): {:.2} GB",
+            est_file_size as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
         info!("Auto-determined subsampling rate: -c {}", auto_c);
         auto_c
     });

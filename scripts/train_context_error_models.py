@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
+import json
 import logging
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -26,10 +29,12 @@ from lib.context_error_models import (
     ContextCounts,
     ContextLengthScreenCounts,
     FitResult,
-    PreviousBasesErrorModel,
     aggregate_context_length_screen_counts,
+    calibrate_to_rate,
+    compute_marginal_error_rate,
     fit_bayesian_and_test,
     fit_and_test,
+    subsample_context_counts,
 )
 from lib.context_h5_cache import (
     cache_path,
@@ -42,9 +47,78 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = Path("../skiver_run")
 DEFAULT_PLATFORMS = ("hq-illumina", "lq-illumina", "ont", "pacbio")
-DEFAULT_CONTEXT_MIN = 1
-DEFAULT_CONTEXT_MAX = 10
+DEFAULT_MODEL_CONFIG = Path("model_config.json")
 PROGRESS_INTERVAL = 50_000
+
+MODEL_TYPES = ("combinatorial_context", "additive_context")
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """Specification for a single model to train.
+
+    Attributes:
+        id: Unique identifier used in artifact filenames and CSV rows.
+        type: Parameterisation — ``"combinatorial_context"`` (full joint) or
+            ``"additive_context"`` (factored over positions).
+        context_length: Number of preceding consensus bases to condition on.
+    """
+
+    id: str
+    type: str
+    context_length: int
+
+    def __post_init__(self) -> None:
+        if self.type not in MODEL_TYPES:
+            raise ValueError(
+                f"Unknown model type {self.type!r}. Must be one of {MODEL_TYPES}."
+            )
+        if self.context_length < 1:
+            raise ValueError("context_length must be at least 1")
+
+    @property
+    def additive_context(self) -> bool:
+        """Return True when this spec uses additive context parameterisation."""
+        return self.type == "additive_context"
+
+
+def load_model_config(path: Path) -> list[ModelSpec]:
+    """Load and validate a JSON model config file.
+
+    Args:
+        path: Path to a JSON file with a ``"models"`` list.
+
+    Returns:
+        Ordered list of validated model specs.
+
+    Raises:
+        ValueError: If the config is malformed or contains duplicate IDs.
+    """
+    with open(path) as handle:
+        raw = json.load(handle)
+
+    if "models" not in raw:
+        raise ValueError(f"{path}: JSON must have a top-level 'models' key")
+
+    specs = []
+    seen_ids: set[str] = set()
+    for i, entry in enumerate(raw["models"]):
+        for field in ("id", "type", "context_length"):
+            if field not in entry:
+                raise ValueError(f"{path}: model[{i}] is missing field {field!r}")
+        spec = ModelSpec(
+            id=str(entry["id"]),
+            type=str(entry["type"]),
+            context_length=int(entry["context_length"]),
+        )
+        if spec.id in seen_ids:
+            raise ValueError(f"{path}: duplicate model id {spec.id!r}")
+        seen_ids.add(spec.id)
+        specs.append(spec)
+
+    if not specs:
+        raise ValueError(f"{path}: 'models' list is empty")
+    return specs
 
 
 def _prefix_from_base_path(path: Path) -> Path:
@@ -70,29 +144,56 @@ def _prefix_summary(prefixes: Sequence[Path]) -> str:
     return ", ".join(prefix.name for prefix in prefixes)
 
 
+def _counts_for_spec(
+    spec: ModelSpec,
+    screen_counts: ContextLengthScreenCounts,
+    *,
+    max_contexts: int | None = None,
+) -> ContextCounts:
+    """Return context counts with additive_context set per the model spec.
+
+    For additive_context models, optionally cap to the top-``max_contexts``
+    most-observed context rows to bound training time.
+    """
+    base = screen_counts.by_length[spec.context_length]
+    if base.additive_context != spec.additive_context:
+        base = dataclasses.replace(base, additive_context=spec.additive_context)
+    if spec.additive_context and max_contexts is not None:
+        base = subsample_context_counts(base, max_contexts)
+    return base
+
+
 def _save_artifact(
     path: Path,
     *,
+    spec: ModelSpec,
     platform: str,
-    model_name: str,
+    train_prefixes: Sequence[Path],
+    test_prefixes: Sequence[Path],
+    data_root: Path,
     mle_fit: FitResult,
     vi_fit: BayesianFitResult,
     train_total: int,
     test_total: int,
     low_count_contexts: int,
-    context_length: int,
+    calibration: dict[str, float] | None = None,
 ) -> None:
     """Save a fitted model artifact."""
     mle_run_transform_values = _run_transform_values(mle_fit.params)
     vi_run_transform_values = _run_transform_values(vi_fit.params_mean)
 
     artifact = {
+        "model_id": spec.id,
+        "model_type": spec.type,
         "platform": platform,
-        "model": model_name,
+        "data_root": str(data_root),
+        "train_prefixes": [str(p) for p in train_prefixes],
+        "test_prefixes": [str(p) for p in test_prefixes],
         "n_train": train_total,
         "n_test": test_total,
         "low_count_contexts": low_count_contexts,
-        "context_length": context_length,
+        "context_length": spec.context_length,
+        "parameterization": spec.type,
         "target": "error_type",
         "notes": (
             "Conditional categorical error model. Sequence context is treated as "
@@ -119,6 +220,7 @@ def _save_artifact(
             "prior_scale": vi_fit.prior_scale,
             "run_transform_values_mean": vi_run_transform_values,
         },
+        "calibration": calibration,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(artifact, path)
@@ -138,8 +240,9 @@ def _run_transform_values(params: dict[str, torch.Tensor]) -> torch.Tensor | Non
 def _write_comparison(path: Path, rows: Sequence[dict[str, object]]) -> None:
     """Write AIC comparison rows to CSV."""
     fieldnames = [
+        "model_id",
+        "model_type",
         "platform",
-        "model",
         "context_length",
         "inference",
         "n_train",
@@ -152,6 +255,9 @@ def _write_comparison(path: Path, rows: Sequence[dict[str, object]]) -> None:
         "aic",
         "low_count_contexts",
         "prior_scale",
+        "weibull_target_rate",
+        "uncalibrated_rate",
+        "calibration_offset",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as handle:
@@ -202,6 +308,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Write an HDF5 row cache when TSV fallback parsing is needed.",
     )
     parser.add_argument(
+        "--model-config",
+        type=Path,
+        default=DEFAULT_MODEL_CONFIG,
+        help=f"JSON file listing models to train (default: {DEFAULT_MODEL_CONFIG}).",
+    )
+    parser.add_argument(
         "--steps",
         type=int,
         default=1000,
@@ -238,18 +350,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Gradient clip norm (default: 10).",
     )
     parser.add_argument(
-        "--context-min",
-        type=int,
-        default=DEFAULT_CONTEXT_MIN,
-        help=f"Minimum previous-base context length (default: {DEFAULT_CONTEXT_MIN}).",
-    )
-    parser.add_argument(
-        "--context-max",
-        type=int,
-        default=DEFAULT_CONTEXT_MAX,
-        help=f"Maximum previous-base context length (default: {DEFAULT_CONTEXT_MAX}).",
-    )
-    parser.add_argument(
         "--pseudo-count",
         type=float,
         default=0.5,
@@ -265,6 +365,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--include-outliers",
         action="store_true",
         help="Include observations from keys that failed the outlier filter.",
+    )
+    parser.add_argument(
+        "--max-contexts",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "For additive_context models: cap the training count tensor to the N "
+            "most-observed contexts before fitting. Has no effect on "
+            "combinatorial_context models. Recommended: 4096–16384 for "
+            "context_length >= 8 (default: no cap)."
+        ),
+    )
+    parser.add_argument(
+        "--weibull-rate",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help=(
+            "Target per-base error rate from skiver Weibull fit "
+            "(``per_base_error_rate`` column of ``{prefix}.summary_error_rate.csv``). "
+            "When provided, a calibration offset is computed post-training and stored "
+            "in the artifact.  Not provided by default (no calibration)."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -511,7 +635,7 @@ def _load_counts(
 def _fit_with_progress(
     *,
     platform: str,
-    model_name: str,
+    model_id: str,
     train_counts: ContextCounts,
     test_counts: ContextCounts,
     args: argparse.Namespace,
@@ -526,7 +650,7 @@ def _fit_with_progress(
     )
     with progress:
         task_id = progress.add_task(
-            f"{platform}/{model_name} train",
+            f"{platform}/{model_id} train",
             total=args.steps,
             loss="n/a",
         )
@@ -550,7 +674,7 @@ def _fit_with_progress(
 def _fit_vi_with_progress(
     *,
     platform: str,
-    model_name: str,
+    model_id: str,
     train_counts: ContextCounts,
     test_counts: ContextCounts,
     args: argparse.Namespace,
@@ -566,7 +690,7 @@ def _fit_vi_with_progress(
     )
     with progress:
         task_id = progress.add_task(
-            f"{platform}/{model_name} VI",
+            f"{platform}/{model_id} VI",
             total=vi_steps,
             loss="n/a",
         )
@@ -591,21 +715,17 @@ def _fit_vi_with_progress(
 def _run_model(
     *,
     platform: str,
-    model: PreviousBasesErrorModel,
+    spec: ModelSpec,
     train_counts: ContextCounts,
     test_counts: ContextCounts,
     args: argparse.Namespace,
 ) -> tuple[FitResult, BayesianFitResult, int, int, int]:
     """Train a model from precomputed counts and return fit metadata."""
-    logger.info(
-        "Starting %s/%s fit from cached counts",
-        platform,
-        model.name,
-    )
+    logger.info("Starting %s/%s fit from cached counts", platform, spec.id)
     logger.info(
         "%s/%s train counts: accepted=%d skipped=%d low_count_contexts=%d",
         platform,
-        model.name,
+        spec.id,
         train_counts.total_observations,
         train_counts.skipped_rows,
         train_counts.low_count_contexts,
@@ -613,20 +733,21 @@ def _run_model(
     logger.info(
         "%s/%s test counts: accepted=%d skipped=%d low_count_contexts=%d",
         platform,
-        model.name,
+        spec.id,
         test_counts.total_observations,
         test_counts.skipped_rows,
         test_counts.low_count_contexts,
     )
     if train_counts.total_observations == 0 or test_counts.total_observations == 0:
-        raise ValueError(f"No usable observations for {platform}/{model.name}")
+        raise ValueError(f"No usable observations for {platform}/{spec.id}")
 
     logger.info(
-        "%s/%s MLE fitting: context_length=%d steps=%d lr=%s clip_norm=%s "
+        "%s/%s MLE fitting: context_length=%d additive=%s steps=%d lr=%s clip_norm=%s "
         "pseudo_count=%s",
         platform,
-        model.name,
-        model.context_length,
+        spec.id,
+        spec.context_length,
+        spec.additive_context,
         args.steps,
         args.lr,
         args.clip_norm,
@@ -634,7 +755,7 @@ def _run_model(
     )
     fit = _fit_with_progress(
         platform=platform,
-        model_name=model.name,
+        model_id=spec.id,
         train_counts=train_counts,
         test_counts=test_counts,
         args=args,
@@ -642,7 +763,7 @@ def _run_model(
     logger.info(
         "%s/%s MLE complete: train_log_likelihood=%.4f test_log_likelihood=%.4f",
         platform,
-        model.name,
+        spec.id,
         fit.train_log_likelihood,
         fit.test_log_likelihood,
     )
@@ -650,14 +771,14 @@ def _run_model(
     logger.info(
         "%s/%s VI fitting: steps=%d lr=%s prior_scale=%s",
         platform,
-        model.name,
+        spec.id,
         vi_steps,
         args.vi_lr,
         args.prior_scale,
     )
     vi_fit = _fit_vi_with_progress(
         platform=platform,
-        model_name=model.name,
+        model_id=spec.id,
         train_counts=train_counts,
         test_counts=test_counts,
         args=args,
@@ -665,7 +786,7 @@ def _run_model(
     logger.info(
         "%s/%s VI complete: train_log_likelihood=%.4f test_log_likelihood=%.4f",
         platform,
-        model.name,
+        spec.id,
         vi_fit.train_log_likelihood,
         vi_fit.test_log_likelihood,
     )
@@ -693,14 +814,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("Use cache: %s", not args.no_cache)
     logger.info("Write cache on TSV fallback: %s", args.write_cache)
     logger.info("Include outliers: %s", args.include_outliers)
+    logger.info("Model config: %s", args.model_config)
+
+    model_specs = load_model_config(args.model_config)
+    logger.info(
+        "Loaded %d model specs: %s",
+        len(model_specs),
+        ", ".join(s.id for s in model_specs),
+    )
+
+    context_lengths = sorted({spec.context_length for spec in model_specs})
+    logger.info("Context lengths required: %s", ", ".join(str(i) for i in context_lengths))
+
     platforms = tuple(args.platform) if args.platform else DEFAULT_PLATFORMS
     logger.info("Platforms: %s", ", ".join(platforms))
-    if args.context_min < 1:
-        raise ValueError("--context-min must be at least 1")
-    if args.context_max < args.context_min:
-        raise ValueError("--context-max must be greater than or equal to --context-min")
-    context_lengths = tuple(range(args.context_min, args.context_max + 1))
-    logger.info("Context lengths: %s", ", ".join(str(i) for i in context_lengths))
+
     rows: list[dict[str, object]] = []
 
     for platform in platforms:
@@ -752,35 +880,95 @@ def main(argv: Sequence[str] | None = None) -> int:
             test_platform_counts.skipped_rows,
         )
 
-        models = tuple(PreviousBasesErrorModel(length) for length in context_lengths)
-        for model in models:
-            train_counts = train_platform_counts.by_length[model.context_length]
-            test_counts = test_platform_counts.by_length[model.context_length]
+        for spec in model_specs:
+            train_counts = _counts_for_spec(spec, train_platform_counts, max_contexts=args.max_contexts)
+            test_counts = _counts_for_spec(spec, test_platform_counts)
 
             mle_fit, vi_fit, n_train, n_test, low_count_contexts = _run_model(
                 platform=platform,
-                model=model,
+                spec=spec,
                 train_counts=train_counts,
                 test_counts=test_counts,
                 args=args,
             )
-            model_path = args.output_dir / f"context_{model.name}_{platform}.pt"
+
+            calibration: dict[str, float] | None = None
+            if args.weibull_rate is not None:
+                raw_mle = compute_marginal_error_rate(
+                    train_counts.counts,
+                    mle_fit.params,
+                    run_values=train_counts.run_values,
+                    additive_context=train_counts.additive_context,
+                    context_indices=train_counts.context_indices,
+                )
+                delta_mle = calibrate_to_rate(
+                    train_counts.counts,
+                    mle_fit.params,
+                    args.weibull_rate,
+                    run_values=train_counts.run_values,
+                    additive_context=train_counts.additive_context,
+                    context_indices=train_counts.context_indices,
+                )
+                raw_vi = compute_marginal_error_rate(
+                    train_counts.counts,
+                    vi_fit.params_mean,
+                    run_values=train_counts.run_values,
+                    additive_context=train_counts.additive_context,
+                    context_indices=train_counts.context_indices,
+                )
+                delta_vi = calibrate_to_rate(
+                    train_counts.counts,
+                    vi_fit.params_mean,
+                    args.weibull_rate,
+                    run_values=train_counts.run_values,
+                    additive_context=train_counts.additive_context,
+                    context_indices=train_counts.context_indices,
+                )
+                calibration = {
+                    "weibull_target_rate": args.weibull_rate,
+                    "uncalibrated_mle_rate": raw_mle,
+                    "calibration_offset_mle": delta_mle,
+                    "uncalibrated_vi_rate": raw_vi,
+                    "calibration_offset_vi": delta_vi,
+                }
+                logger.info(
+                    "%s/%s MLE calibration: rate %.6f → %.6f (δ=%.4f)",
+                    platform,
+                    spec.id,
+                    raw_mle,
+                    args.weibull_rate,
+                    delta_mle,
+                )
+                logger.info(
+                    "%s/%s VI  calibration: rate %.6f → %.6f (δ=%.4f)",
+                    platform,
+                    spec.id,
+                    raw_vi,
+                    args.weibull_rate,
+                    delta_vi,
+                )
+
+            model_path = args.output_dir / f"{spec.id}_{platform}.pt"
             _save_artifact(
                 model_path,
+                spec=spec,
                 platform=platform,
-                model_name=model.name,
+                train_prefixes=train_prefixes,
+                test_prefixes=test_prefixes,
+                data_root=args.data_root,
                 mle_fit=mle_fit,
                 vi_fit=vi_fit,
                 train_total=n_train,
                 test_total=n_test,
                 low_count_contexts=low_count_contexts,
-                context_length=model.context_length,
+                calibration=calibration,
             )
             rows.append(
                 {
+                    "model_id": spec.id,
+                    "model_type": spec.type,
                     "platform": platform,
-                    "model": model.name,
-                    "context_length": model.context_length,
+                    "context_length": spec.context_length,
                     "inference": "maximum_likelihood",
                     "n_train": n_train,
                     "n_test": n_test,
@@ -792,13 +980,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "aic": mle_fit.aic,
                     "low_count_contexts": low_count_contexts,
                     "prior_scale": "",
+                    "weibull_target_rate": args.weibull_rate if args.weibull_rate is not None else "",
+                    "uncalibrated_rate": calibration["uncalibrated_mle_rate"] if calibration else "",
+                    "calibration_offset": calibration["calibration_offset_mle"] if calibration else "",
                 }
             )
             rows.append(
                 {
+                    "model_id": spec.id,
+                    "model_type": spec.type,
                     "platform": platform,
-                    "model": model.name,
-                    "context_length": model.context_length,
+                    "context_length": spec.context_length,
                     "inference": "variational_inference",
                     "n_train": n_train,
                     "n_test": n_test,
@@ -810,12 +1002,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "aic": "",
                     "low_count_contexts": low_count_contexts,
                     "prior_scale": vi_fit.prior_scale,
+                    "weibull_target_rate": args.weibull_rate if args.weibull_rate is not None else "",
+                    "uncalibrated_rate": calibration["uncalibrated_vi_rate"] if calibration else "",
+                    "calibration_offset": calibration["calibration_offset_vi"] if calibration else "",
                 }
             )
             logger.info(
                 "%s/%s MLE test_log_likelihood=%.4f k=%d AIC=%.4f",
                 platform,
-                model.name,
+                spec.id,
                 mle_fit.test_log_likelihood,
                 mle_fit.num_parameters,
                 mle_fit.aic,
@@ -823,7 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger.info(
                 "%s/%s VI test_log_likelihood=%.4f test_elbo=%.4f",
                 platform,
-                model.name,
+                spec.id,
                 vi_fit.test_log_likelihood,
                 vi_fit.test_elbo,
             )

@@ -1,9 +1,15 @@
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[clap(author, version, about = "Skiver: Alignment-free estimation of sequencing error rates and spectra using (k,v)-mer sketches", arg_required_else_help = true, disable_help_subcommand = true)]
+#[clap(
+    author,
+    version,
+    about = "Skiver: Alignment-free estimation of sequencing error rates and spectra using (k,v)-mer sketches",
+    arg_required_else_help = true,
+    disable_help_subcommand = true
+)]
 pub struct Cli {
-    #[clap(subcommand,)]
+    #[clap(subcommand)]
     pub mode: Mode,
 }
 
@@ -28,80 +34,180 @@ pub enum Mode {
 
 #[derive(Args, Default)]
 pub struct SketchArgs {
-    #[clap(multiple=true, help_heading = "INPUT", help = "fasta/fastq files; gzip optional.")]
+    #[clap(
+        multiple = true,
+        help_heading = "INPUT",
+        help = "fasta/fastq files; gzip optional."
+    )]
     pub files: Vec<String>,
 
-    #[clap(short, default_value_t = 21, help_heading = "ALGORITHM", help ="Length of keys.")]
+    #[clap(
+        short,
+        default_value_t = 21,
+        help_heading = "ALGORITHM",
+        help = "Length of keys."
+    )]
     pub k: u8,
 
-    #[clap(short, default_value_t = 13, help_heading = "ALGORITHM", help ="Length of values.")]
+    #[clap(
+        short,
+        default_value_t = 13,
+        help_heading = "ALGORITHM",
+        help = "Length of values."
+    )]
     pub v: u8,
 
-    #[clap(short, help_heading = "ALGORITHM", help = "Subsampling rate. If not set, automatically determined as ceiling(total_input_size / 16G) * 1000 (decompressed size estimated as 4x for .gz files).")]
+    #[clap(
+        short,
+        help_heading = "ALGORITHM",
+        help = "Subsampling rate. If not set, automatically determined as ceiling(total_input_size / 16G) * 1000 (decompressed size estimated as 4x for .gz files)."
+    )]
     pub c: Option<usize>,
 
-    #[clap(short = 'f', default_value_t = 0, help_heading = "INPUT", help = "Number of bases to trim from the start of each read.")]
+    #[clap(
+        short = 'f',
+        default_value_t = 0,
+        help_heading = "INPUT",
+        help = "Number of bases to trim from the start of each read."
+    )]
     pub trim_front: usize,
 
-    #[clap(short = 'b', default_value_t = 0, help_heading = "INPUT", help = "Number of bases to trim from the end of each read.")]
+    #[clap(
+        short = 'b',
+        default_value_t = 0,
+        help_heading = "INPUT",
+        help = "Number of bases to trim from the end of each read."
+    )]
     pub trim_back: usize,
 
     //#[clap(short, default_value_t = 4, help_heading = "ALGORITHM", help = "Number of threads.")]
     //pub threads: usize,
-
     #[clap(short, default_value_t = String::new(), help_heading = "OUTPUT", help = "Output file.")]
     pub output_path: String,
 
-    #[clap(long, help_heading = "ALGORITHM", help = "Use the forward strand of the reads only. Default: use both forward and reverse strands of the reads.")]
+    #[clap(
+        long,
+        help_heading = "ALGORITHM",
+        help = "Use the forward strand of the reads only. Default: use both forward and reverse strands of the reads."
+    )]
     pub forward_only: bool,
 }
 
-
 #[derive(Args, Default, Clone)]
 pub struct AnalyzeArgs {
-    #[clap(multiple=true, help_heading = "INPUT", help = "fasta/fastq files; gzip optional.")]
+    #[clap(
+        multiple = true,
+        help_heading = "INPUT",
+        help = "fasta/fastq files; gzip optional."
+    )]
     pub files: Vec<String>,
 
-    #[clap(short = 'k', default_value_t = 21, help_heading = "ALGORITHM", help ="Length of keys.")]
+    #[clap(
+        short = 'k',
+        default_value_t = 21,
+        help_heading = "ALGORITHM",
+        help = "Length of keys."
+    )]
     pub k: u8,
 
-    #[clap(short = 'v', default_value_t = 13, help_heading = "ALGORITHM", help ="Length of values.")]
+    #[clap(
+        short = 'v',
+        default_value_t = 13,
+        help_heading = "ALGORITHM",
+        help = "Length of values."
+    )]
     pub v: u8,
 
-    #[clap(short = 'c', help_heading = "ALGORITHM", help = "Subsampling rate. If not set, automatically determined as ceiling(total_input_size / 16G) * 1000 (decompressed size estimated as 4x for .gz files).")]
+    #[clap(
+        short = 'c',
+        help_heading = "ALGORITHM",
+        help = "Subsampling rate. If not set, automatically determined as ceiling(total_input_size / 16G) * 1000 (decompressed size estimated as 4x for .gz files)."
+    )]
     pub c: Option<usize>,
 
-    #[clap(short = 'l', long = "lower-bound", help_heading = "ALGORITHM", help = "Lower bound for the number of times the consensus appears in the read for it to be considered in the profiling. Default: 0 when the reference ('-r') is provided, 10 otherwise.")]
+    #[clap(
+        short = 'l',
+        long = "lower-bound",
+        help_heading = "ALGORITHM",
+        help = "Lower bound for the number of times the consensus appears in the read for it to be considered in the profiling. Default: 0 when the reference ('-r') is provided, 10 otherwise."
+    )]
     pub lower_bound: Option<u32>,
 
-    #[clap(long, help_heading = "ALGORITHM", help = "Use the forward strand of the reads only. Default: use both forward and reverse strands of the reads.")]
+    #[clap(
+        long,
+        help_heading = "ALGORITHM",
+        help = "Use the forward strand of the reads only. Default: use both forward and reverse strands of the reads."
+    )]
     pub forward_only: bool,
 
-    #[clap(long = "use-all", help_heading = "ALGORITHM", help = "Not excluding the outliers.")]
+    #[clap(
+        long = "use-all",
+        help_heading = "ALGORITHM",
+        help = "Not excluding the outliers."
+    )]
     pub use_all: bool,
 
-    #[clap(short = 'e', long = "outlier-threshold", default_value_t = 1e-9, help_heading = "ALGORITHM", help = "P-value threshold for the Binomial outlier test: a key is removed if P(X <= observed) < threshold under the fitted Weibull hazard model.")]
+    #[clap(
+        short = 'e',
+        long = "outlier-threshold",
+        default_value_t = 1e-9,
+        help_heading = "ALGORITHM",
+        help = "P-value threshold for the Binomial outlier test: a key is removed if P(X <= observed) < threshold under the fitted Weibull hazard model."
+    )]
     pub outlier_threshold: f32,
 
-    #[clap(long = "num-experiments", default_value_t = 100, hidden = true, help_heading = "ALGORITHM", help = "Number of experiments in bootstrapping for estimating the parameters.")]
+    #[clap(
+        long = "num-experiments",
+        default_value_t = 100,
+        hidden = true,
+        help_heading = "ALGORITHM",
+        help = "Number of experiments in bootstrapping for estimating the parameters."
+    )]
     pub num_experiments: u32,
 
-    #[clap(short = 'r', long = "reference", help_heading = "ALGORITHM", help = "Reference genomes.")]
+    #[clap(
+        short = 'r',
+        long = "reference",
+        help_heading = "ALGORITHM",
+        help = "Reference genomes."
+    )]
     pub reference: Option<String>,
 
-    #[clap(short = 'f', long = "trim-front", hidden = true, default_value_t = 0, help_heading = "INPUT", help = "Number of bases to trim from the start of each read.")]
+    #[clap(
+        short = 'f',
+        long = "trim-front",
+        hidden = true,
+        default_value_t = 0,
+        help_heading = "INPUT",
+        help = "Number of bases to trim from the start of each read."
+    )]
     pub trim_front: usize,
 
-    #[clap(short = 'b', long = "trim-back", hidden = true, default_value_t = 0, help_heading = "INPUT", help = "Number of bases to trim from the end of each read.")]
+    #[clap(
+        short = 'b',
+        long = "trim-back",
+        hidden = true,
+        default_value_t = 0,
+        help_heading = "INPUT",
+        help = "Number of bases to trim from the end of each read."
+    )]
     pub trim_back: usize,
 
-    #[clap(long, default_value_t = 2, hidden = true, help_heading = "ALGORITHM", help = "Number of estimated hazard ratios to ignore from the largest v.")]
+    #[clap(
+        long,
+        default_value_t = 2,
+        hidden = true,
+        help_heading = "ALGORITHM",
+        help = "Number of estimated hazard ratios to ignore from the largest v."
+    )]
     pub ignore_last_hazard_ratios: usize,
 
-    //#[clap(short = 't', long = "threads", default_value_t = 4, help_heading = "ALGORITHM", help = "Number of threads.")]
-    //pub threads: usize,
-
-    #[clap(short = 'o', long = "output-prefix", help_heading = "OUTPUT", help = "Output prefix. When set, writes the report to <prefix>.*.csv.")]
+    #[clap(
+        short = 'o',
+        long = "output-prefix",
+        help_heading = "OUTPUT",
+        help = "Output prefix. When set, writes the report to <prefix>.*.csv."
+    )]
     pub output_prefix: Option<String>,
 
     #[clap(long, default_value_t = String::from("sum_ratio"), hidden = true, help = "One of 'slope', 'linear_fit', 'ratio_mean', 'sum_ratio'.")]
@@ -110,43 +216,86 @@ pub struct AnalyzeArgs {
     #[clap(long, default_value_t = String::from("weibull"), help = "Model used to fit the hazard rates vs. t. Should be one of 'constant' (assuming that the hazard rate is constant over t), 'weibull' (assuming T follows a discrete Weibull distribution).")]
     pub hazard_model: String,
 
-    #[clap(long = "first-base-only", hidden = true, help = "In ReadPositionSummary and PhredScoreSummary, consider only the first base of each value instead of all bases up to an error.")]
+    #[clap(
+        long = "first-base-only",
+        hidden = true,
+        help = "In ReadPositionSummary and PhredScoreSummary, consider only the first base of each value instead of all bases up to an error."
+    )]
     pub first_base_only: bool,
 }
 
 #[derive(Args, Default)]
 pub struct MapArgs {
-    #[clap(multiple=true, help_heading = "INPUT", help = "fasta/fastq files; gzip optional.")]
+    #[clap(
+        multiple = true,
+        help_heading = "INPUT",
+        help = "fasta/fastq files; gzip optional."
+    )]
     pub files: Vec<String>,
 
-    #[clap(short, default_value_t = 21, help_heading = "ALGORITHM", help ="Length of keys.")]
+    #[clap(
+        short,
+        default_value_t = 21,
+        help_heading = "ALGORITHM",
+        help = "Length of keys."
+    )]
     pub k: u8,
 
-    #[clap(short, default_value_t = 1000, help_heading = "ALGORITHM", help = "Subsampling rate.")]
+    #[clap(
+        short,
+        default_value_t = 1000,
+        help_heading = "ALGORITHM",
+        help = "Subsampling rate."
+    )]
     pub c: usize,
 
-    #[clap(short, default_value_t = 100, help_heading = "ALGORITHM", help = "Read sampling rate.")]
+    #[clap(
+        short,
+        default_value_t = 100,
+        help_heading = "ALGORITHM",
+        help = "Read sampling rate."
+    )]
     pub sample_rate: usize,
 
-    #[clap(short, default_value_t = 5, help_heading = "ALGORITHM", help = "Lower bound for the number of times the consensus appears in the read for it to be considered in the profiling.")]
+    #[clap(
+        short,
+        default_value_t = 5,
+        help_heading = "ALGORITHM",
+        help = "Lower bound for the number of times the consensus appears in the read for it to be considered in the profiling."
+    )]
     pub lower_bound: u32,
 
-    #[clap(long, help_heading = "ALGORITHM", help = "Use the forward strand of the reads only. Default: use both forward and reverse strands of the reads.")]
+    #[clap(
+        long,
+        help_heading = "ALGORITHM",
+        help = "Use the forward strand of the reads only. Default: use both forward and reverse strands of the reads."
+    )]
     pub forward_only: bool,
 
     #[clap(short, help_heading = "ALGORITHM", help = "Reference genomes.")]
     pub reference: String,
 
-    #[clap(short = 'f', default_value_t = 0, help_heading = "INPUT", help = "Number of bases to trim from the start of each read.")]
+    #[clap(
+        short = 'f',
+        default_value_t = 0,
+        help_heading = "INPUT",
+        help = "Number of bases to trim from the start of each read."
+    )]
     pub trim_front: usize,
 
-    #[clap(short = 'b', default_value_t = 0, help_heading = "INPUT", help = "Number of bases to trim from the end of each read.")]
+    #[clap(
+        short = 'b',
+        default_value_t = 0,
+        help_heading = "INPUT",
+        help = "Number of bases to trim from the end of each read."
+    )]
     pub trim_back: usize,
 
-    //#[clap(short, default_value_t = 4, help_heading = "ALGORITHM", help = "Number of threads.")]
-    //pub threads: usize,
-
-    #[clap(short, help_heading = "OUTPUT", help = "Verbose output per-read k-mer hit information to stdout.")]
+    #[clap(
+        short,
+        help_heading = "OUTPUT",
+        help = "Verbose output per-read k-mer hit information to stdout."
+    )]
     pub print_verbose: bool,
 }
 
@@ -157,15 +306,47 @@ pub struct DumpArgs {
     #[clap(flatten)]
     pub analyze: AnalyzeArgs,
 
-    #[clap(long, help_heading = "OUTPUT",
-           help = "Write {prefix}.raw_observations.tsv: one row per (key, value, occurrence).")]
+    #[clap(
+        long,
+        help_heading = "OUTPUT",
+        help = "Write {prefix}.raw_observations.tsv: one row per (key, value, occurrence)."
+    )]
     pub raw: bool,
 
-    #[clap(long, help_heading = "OUTPUT",
-           help = "Write {prefix}.base_observations.tsv: one row per base position for 0-edit and 1-edit values (aligned to consensus).")]
+    #[clap(
+        long,
+        help_heading = "OUTPUT",
+        help = "Write {prefix}.base_observations.tsv: one row per base position for 0-edit and 1-edit values (aligned to consensus)."
+    )]
     pub base: bool,
 
-    #[clap(long, help_heading = "OUTPUT",
-           help = "Write {prefix}.survival_observations.tsv: one row per occurrence with first-error position.")]
+    #[clap(
+        long,
+        help_heading = "OUTPUT",
+        help = "Write {prefix}.survival_observations.tsv: one row per occurrence with first-error position."
+    )]
     pub survival: bool,
+
+    #[clap(
+        long,
+        help_heading = "OUTPUT",
+        help = "Write {prefix}.windows.bin: compact binary with one (read_id, start_index, error_type) record per sampled kv-mer."
+    )]
+    pub windows: bool,
+
+    #[clap(
+        long,
+        help_heading = "OUTPUT",
+        value_name = "C",
+        help = "Sparsity for windows output only (must be >= sketch -c). Defaults to the sketch -c value."
+    )]
+    pub windows_c: Option<u64>,
+
+    #[clap(
+        long,
+        help_heading = "OUTPUT",
+        value_name = "N",
+        help = "Limit windows output to reads 0..N-1. Other outputs are unaffected."
+    )]
+    pub windows_reads: Option<u64>,
 }

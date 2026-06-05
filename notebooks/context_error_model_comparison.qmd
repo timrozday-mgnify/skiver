@@ -1,0 +1,989 @@
+---
+title: "Context Error Model: Performance Comparison"
+jupyter: skiver
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  execute-dir: file
+---
+
+This report compares the held-out predictive performance of all trained
+context-dependent sequencing error models across every platform (dataset).
+The aim is to identify which model type and context length performs best on
+each platform.  **No parameter values or credible intervals are shown.**
+
+```{python}
+#| echo: false
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from IPython.display import Markdown, display
+
+RESULTS_DIR = Path("../context_error_models")
+
+# ── Load ──────────────────────────────────────────────────────────────────────
+df = pd.read_csv(RESULTS_DIR / "context_model_aic.csv")
+
+for col in [
+    "context_length", "n_train", "n_test",
+    "train_log_likelihood", "test_log_likelihood",
+    "train_elbo", "test_elbo",
+    "num_parameters", "aic", "low_count_contexts", "prior_scale",
+]:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# ── Derived metrics ───────────────────────────────────────────────────────────
+df["test_nll_per_base"]   = -df["test_log_likelihood"] / df["n_test"]
+df["train_nll_per_base"]  = -df["train_log_likelihood"] / df["n_train"]
+df["test_perplexity"]     = np.exp(df["test_nll_per_base"])
+df["test_elbo_per_base"]  = df["test_elbo"] / df["n_test"]
+
+# Friendly labels
+_type_labels = {
+    "combinatorial_context": "Combinatorial",
+    "additive_context":      "Additive",
+}
+_infer_labels = {
+    "maximum_likelihood": "MLE",
+    "variational_inference": "VI",
+}
+_platform_labels = {
+    "hq-illumina": "HQ Illumina",
+    "lq-illumina": "LQ Illumina",
+    "ont":         "ONT",
+    "pacbio":      "PacBio",
+}
+df["model_type_label"] = df["model_type"].map(_type_labels).fillna(df["model_type"])
+df["inference_label"]  = df["inference"].map(_infer_labels).fillna(df["inference"])
+df["platform_label"]   = df["platform"].map(_platform_labels).fillna(df["platform"])
+
+# ── MLE subset with AIC-derived quantities ────────────────────────────────────
+mle = df[df["inference"] == "maximum_likelihood"].copy()
+mle["delta_aic"] = mle.groupby("platform")["aic"].transform(lambda x: x - x.min())
+mle["akaike_weight"] = mle.groupby("platform")["delta_aic"].transform(
+    lambda x: np.exp(-0.5 * x) / np.exp(-0.5 * x).sum()
+)
+mle["delta_nll"] = mle.groupby("platform")["test_nll_per_base"].transform(
+    lambda x: x - x.min()
+)
+
+# ── VI subset ─────────────────────────────────────────────────────────────────
+vi = df[df["inference"] == "variational_inference"].copy()
+vi["delta_test_nll"] = vi.groupby("platform")["test_nll_per_base"].transform(
+    lambda x: x - x.min()
+)
+vi["delta_test_elbo"] = vi.groupby("platform")["test_elbo_per_base"].transform(
+    lambda x: x - x.max()   # elbo: higher is better → delta = max − x
+)
+
+PLATFORM_ORDER = ["hq-illumina", "lq-illumina", "ont", "pacbio"]
+PLATFORM_LABELS_ORDERED = [_platform_labels[p] for p in PLATFORM_ORDER]
+
+# Make platform_label a Categorical so px.line facets appear in a fixed order
+df["platform_label"] = pd.Categorical(
+    df["platform_label"], categories=PLATFORM_LABELS_ORDERED, ordered=True
+)
+mle["platform_label"] = pd.Categorical(
+    mle["platform_label"], categories=PLATFORM_LABELS_ORDERED, ordered=True
+)
+vi["platform_label"] = pd.Categorical(
+    vi["platform_label"], categories=PLATFORM_LABELS_ORDERED, ordered=True
+)
+```
+
+## Best Model by Platform — Summary
+
+```{python}
+#| echo: false
+#| label: tbl-best-overall
+#| tbl-cap: "Best model per platform by test NLL per base (lower is better). All inference methods included."
+
+cols_show = [
+    "platform_label", "inference_label", "model_type_label",
+    "context_length", "test_nll_per_base", "test_perplexity",
+]
+
+best_overall = (
+    df.sort_values("test_nll_per_base")
+      .groupby("platform", sort=False)
+      .first()
+      .reset_index()
+      .assign(platform=lambda d: pd.Categorical(d["platform"], PLATFORM_ORDER, ordered=True))
+      .sort_values("platform")
+)[cols_show].rename(columns={
+    "platform_label":    "Platform",
+    "inference_label":   "Inference",
+    "model_type_label":  "Model type",
+    "context_length":    "Context length",
+    "test_nll_per_base": "Test NLL / base",
+    "test_perplexity":   "Perplexity",
+})
+best_overall["Test NLL / base"] = best_overall["Test NLL / base"].map("{:.6f}".format)
+best_overall["Perplexity"]      = best_overall["Perplexity"].map("{:.6f}".format)
+Markdown(best_overall.to_markdown(index=False))
+```
+
+```{python}
+#| echo: false
+#| label: tbl-best-mle
+#| tbl-cap: "Best MLE model per platform by AIC."
+
+cols_mle = [
+    "platform_label", "model_type_label", "context_length",
+    "num_parameters", "aic", "delta_aic", "akaike_weight",
+    "test_nll_per_base",
+]
+best_mle = (
+    mle.sort_values("aic")
+       .groupby("platform", sort=False)
+       .first()
+       .reset_index()
+       .assign(platform=lambda d: pd.Categorical(d["platform"], PLATFORM_ORDER, ordered=True))
+       .sort_values("platform")
+)[cols_mle].rename(columns={
+    "platform_label":    "Platform",
+    "model_type_label":  "Model type",
+    "context_length":    "Context length",
+    "num_parameters":    "Parameters",
+    "aic":               "AIC",
+    "delta_aic":         "ΔAIC",
+    "akaike_weight":     "Akaike weight",
+    "test_nll_per_base": "Test NLL / base",
+})
+for c in ("AIC", "ΔAIC"):
+    best_mle[c] = best_mle[c].map("{:.1f}".format)
+best_mle["Akaike weight"] = best_mle["Akaike weight"].map("{:.4f}".format)
+best_mle["Test NLL / base"] = best_mle["Test NLL / base"].map("{:.6f}".format)
+Markdown(best_mle.to_markdown(index=False))
+```
+
+## Held-out NLL per Base
+
+Lower NLL per base indicates better compression of the held-out error
+distribution — i.e., a more accurate model.
+
+### By context length (all inference methods)
+
+```{python}
+#| label: fig-nll-all
+#| fig-cap: "Test NLL per base across context lengths, faceted by platform. Each line is one (model type × inference) combination."
+#| fig-alt: "Line plots of held-out NLL per base versus context length, one facet per platform."
+
+_df = df.copy()
+_df["combo"] = _df["model_type_label"] + " / " + _df["inference_label"]
+
+fig = px.line(
+    _df.sort_values(["platform", "context_length"]),
+    x="context_length",
+    y="test_nll_per_base",
+    color="combo",
+    symbol="combo",
+    markers=True,
+    facet_col="platform_label",
+    hover_data=["model_id", "num_parameters", "n_test"],
+    labels={
+        "context_length":    "Context length",
+        "test_nll_per_base": "Test NLL / base",
+        "combo":             "Model / inference",
+    },
+    title="Held-out NLL per base",
+    color_discrete_sequence=px.colors.qualitative.Plotly,
+)
+fig.update_layout(template="plotly_white", height=380, legend_title_text="Model / inference")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None)
+fig.update_xaxes(title_text="", dtick=2)
+fig.update_layout(
+    annotations=fig.layout.annotations
+    + (dict(text="Context length", x=0.5, y=-0.12, xref="paper",
+            yref="paper", showarrow=False, font_size=12),),
+)
+fig.show()
+```
+
+### Delta-NLL vs. best model per platform (MLE)
+
+Shows how much each MLE model is worse than the best MLE model on the same
+platform; a value of 0 indicates the best model for that platform.
+
+```{python}
+#| label: fig-delta-nll-mle
+#| fig-cap: "Excess test NLL per base relative to the best MLE model on each platform."
+#| fig-alt: "Line plots of ΔNLL per base versus context length for MLE models, faceted by platform."
+
+fig = px.line(
+    mle.sort_values(["platform", "context_length"]),
+    x="context_length",
+    y="delta_nll",
+    color="model_type_label",
+    symbol="model_type_label",
+    markers=True,
+    facet_col="platform_label",
+    hover_data=["model_id", "aic", "num_parameters"],
+    labels={
+        "context_length":  "Context length",
+        "delta_nll":       "ΔNLL / base vs. best",
+        "model_type_label":"Model type",
+    },
+    title="Excess NLL per base relative to best MLE model (per platform)",
+    color_discrete_map={
+        "Combinatorial": px.colors.qualitative.Plotly[0],
+        "Additive":      px.colors.qualitative.Plotly[1],
+    },
+)
+fig.update_layout(template="plotly_white", height=380, legend_title_text="Model type")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None)
+fig.update_xaxes(title_text="", dtick=2)
+fig.add_hline(y=0, line_dash="dot", line_color="#555555", line_width=1)
+fig.show()
+```
+
+### Heatmap: test NLL per base across all models and platforms
+
+```{python}
+#| label: fig-nll-heatmap
+#| fig-cap: "Heatmap of test NLL per base. Rows are (platform × inference); columns are model IDs ordered by type then context length."
+#| fig-alt: "Heatmap showing test NLL per base for every model–platform combination."
+
+_pivot = df.pivot_table(
+    index=["platform_label", "inference_label"],
+    columns="model_id",
+    values="test_nll_per_base",
+)
+
+# Column order: combinatorial by length, then additive by length
+_col_order = (
+    df[["model_id", "model_type", "context_length"]]
+    .drop_duplicates()
+    .sort_values(["model_type", "context_length"])
+    ["model_id"]
+    .tolist()
+)
+_col_order = [c for c in _col_order if c in _pivot.columns]
+_pivot = _pivot[_col_order]
+
+# Row order
+_row_order = [
+    (lbl, inf)
+    for lbl in PLATFORM_LABELS_ORDERED
+    for inf in ["MLE", "VI"]
+    if (lbl, inf) in _pivot.index
+]
+_pivot = _pivot.loc[_row_order]
+
+_row_labels = [f"{p} / {i}" for p, i in _pivot.index]
+
+fig = go.Figure(go.Heatmap(
+    z=_pivot.to_numpy(),
+    x=_pivot.columns.tolist(),
+    y=_row_labels,
+    colorscale="Blues",
+    reversescale=True,
+    colorbar=dict(title="NLL / base"),
+    hovertemplate="model=%{x}<br>row=%{y}<br>NLL/base=%{z:.6f}<extra></extra>",
+))
+fig.update_layout(
+    template="plotly_white",
+    title="Test NLL per base (lower = better)",
+    xaxis_title="Model ID",
+    yaxis_title="",
+    height=max(300, 42 * len(_row_labels)),
+    xaxis=dict(tickangle=-45),
+)
+fig.show()
+```
+
+## AIC Analysis (MLE)
+
+AIC penalises model complexity; lower AIC indicates a better
+complexity–fit trade-off.  The Akaike weight (sum to 1 within each
+platform) gives the relative probability that a model is the best MLE
+model for that platform.
+
+### Delta-AIC vs. context length
+
+```{python}
+#| label: fig-delta-aic
+#| fig-cap: "ΔAIC relative to the best MLE model per platform."
+#| fig-alt: "Line plots of ΔAIC versus context length, faceted by platform."
+
+fig = px.line(
+    mle.sort_values(["platform", "context_length"]),
+    x="context_length",
+    y="delta_aic",
+    color="model_type_label",
+    symbol="model_type_label",
+    markers=True,
+    facet_col="platform_label",
+    hover_data=["model_id", "aic", "num_parameters", "akaike_weight"],
+    labels={
+        "context_length":   "Context length",
+        "delta_aic":        "ΔAIC vs. best",
+        "model_type_label": "Model type",
+    },
+    title="ΔAIC relative to best MLE model per platform",
+    color_discrete_map={
+        "Combinatorial": px.colors.qualitative.Plotly[0],
+        "Additive":      px.colors.qualitative.Plotly[1],
+    },
+)
+fig.update_layout(template="plotly_white", height=380, legend_title_text="Model type")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None, type="log")
+fig.update_xaxes(title_text="", dtick=2)
+fig.add_hline(y=0, line_dash="dot", line_color="#555555", line_width=1)
+fig.show()
+```
+
+### Akaike weights
+
+```{python}
+#| label: fig-akaike-weights
+#| fig-cap: "Akaike weights per platform. A weight near 1 indicates a clear single best model."
+#| fig-alt: "Bar chart of Akaike weights for each MLE model, faceted by platform."
+
+_mle_sorted = mle.sort_values(["platform", "model_type", "context_length"])
+
+fig = px.bar(
+    _mle_sorted,
+    x="model_id",
+    y="akaike_weight",
+    color="model_type_label",
+    facet_col="platform_label",
+    hover_data=["context_length", "aic", "delta_aic", "num_parameters"],
+    labels={
+        "model_id":         "Model ID",
+        "akaike_weight":    "Akaike weight",
+        "model_type_label": "Model type",
+    },
+    title="Akaike weights per platform (MLE models)",
+    color_discrete_map={
+        "Combinatorial": px.colors.qualitative.Plotly[0],
+        "Additive":      px.colors.qualitative.Plotly[1],
+    },
+)
+fig.update_layout(template="plotly_white", height=400, legend_title_text="Model type")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None)
+fig.update_xaxes(tickangle=-60)
+fig.show()
+```
+
+## ELBO Analysis (Variational Inference)
+
+The test ELBO per base is a lower bound on the test log-likelihood for VI
+models; higher ELBO (less negative) indicates a better fit.
+
+### ELBO per base vs. context length
+
+```{python}
+#| label: fig-elbo
+#| fig-cap: "Test ELBO per base for VI models across context lengths."
+#| fig-alt: "Line plots of test ELBO per base versus context length, faceted by platform."
+
+fig = px.line(
+    vi.sort_values(["platform", "context_length"]),
+    x="context_length",
+    y="test_elbo_per_base",
+    color="model_type_label",
+    symbol="model_type_label",
+    markers=True,
+    facet_col="platform_label",
+    hover_data=["model_id", "prior_scale", "n_test"],
+    labels={
+        "context_length":      "Context length",
+        "test_elbo_per_base":  "Test ELBO / base",
+        "model_type_label":    "Model type",
+    },
+    title="Test ELBO per base (VI models; higher = better)",
+    color_discrete_map={
+        "Combinatorial": px.colors.qualitative.Plotly[0],
+        "Additive":      px.colors.qualitative.Plotly[1],
+    },
+)
+fig.update_layout(template="plotly_white", height=380, legend_title_text="Model type")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None)
+fig.update_xaxes(title_text="", dtick=2)
+fig.show()
+```
+
+### Delta-ELBO vs. context length
+
+```{python}
+#| label: fig-delta-elbo
+#| fig-cap: "Excess ELBO gap relative to the best VI model on each platform (0 = best)."
+#| fig-alt: "Line plots of excess ELBO gap versus context length for VI models."
+
+fig = px.line(
+    vi.sort_values(["platform", "context_length"]),
+    x="context_length",
+    y="delta_test_elbo",
+    color="model_type_label",
+    symbol="model_type_label",
+    markers=True,
+    facet_col="platform_label",
+    hover_data=["model_id", "prior_scale"],
+    labels={
+        "context_length":   "Context length",
+        "delta_test_elbo":  "ΔELBO / base vs. best",
+        "model_type_label": "Model type",
+    },
+    title="ELBO gap relative to best VI model per platform (lower = worse)",
+    color_discrete_map={
+        "Combinatorial": px.colors.qualitative.Plotly[0],
+        "Additive":      px.colors.qualitative.Plotly[1],
+    },
+)
+fig.update_layout(template="plotly_white", height=380, legend_title_text="Model type")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None)
+fig.update_xaxes(title_text="", dtick=2)
+fig.add_hline(y=0, line_dash="dot", line_color="#555555", line_width=1)
+fig.show()
+```
+
+## Model Rankings
+
+### Full ranking table — MLE
+
+```{python}
+#| echo: false
+#| label: tbl-rank-mle
+#| tbl-cap: "All MLE models ranked by test NLL per base within each platform."
+
+try:
+    from itables import show as itshow
+    _rank_mle = (
+        mle.assign(
+            rank=mle.groupby("platform")["test_nll_per_base"].rank(method="first").astype(int)
+        )
+        .sort_values(["platform", "rank"])
+        [[
+            "platform_label", "rank", "model_id", "model_type_label",
+            "context_length", "num_parameters", "test_nll_per_base",
+            "test_perplexity", "aic", "delta_aic", "akaike_weight",
+        ]]
+        .rename(columns={
+            "platform_label":    "Platform",
+            "rank":              "Rank",
+            "model_id":          "Model",
+            "model_type_label":  "Type",
+            "context_length":    "Context",
+            "num_parameters":    "Parameters",
+            "test_nll_per_base": "Test NLL/base",
+            "test_perplexity":   "Perplexity",
+            "aic":               "AIC",
+            "delta_aic":         "ΔAIC",
+            "akaike_weight":     "Akaike weight",
+        })
+    )
+    for c in ["Test NLL/base", "Perplexity", "AIC", "ΔAIC", "Akaike weight"]:
+        _rank_mle[c] = _rank_mle[c].map("{:.4g}".format)
+    itshow(_rank_mle, paging=True, pageLength=16, searching=True)
+except ImportError:
+    Markdown(
+        mle.assign(
+            rank=mle.groupby("platform")["test_nll_per_base"].rank(method="first").astype(int)
+        )
+        .sort_values(["platform", "rank"])
+        [["platform_label","rank","model_id","model_type_label","context_length",
+          "test_nll_per_base","aic","delta_aic","akaike_weight"]]
+        .to_markdown(index=False, floatfmt=".4g")
+    )
+```
+
+### Full ranking table — VI
+
+```{python}
+#| echo: false
+#| label: tbl-rank-vi
+#| tbl-cap: "All VI models ranked by test NLL per base within each platform."
+
+try:
+    from itables import show as itshow
+    _rank_vi = (
+        vi.assign(
+            rank=vi.groupby("platform")["test_nll_per_base"].rank(method="first").astype(int)
+        )
+        .sort_values(["platform", "rank"])
+        [[
+            "platform_label", "rank", "model_id", "model_type_label",
+            "context_length", "test_nll_per_base", "test_perplexity",
+            "test_elbo_per_base",
+        ]]
+        .rename(columns={
+            "platform_label":     "Platform",
+            "rank":               "Rank",
+            "model_id":           "Model",
+            "model_type_label":   "Type",
+            "context_length":     "Context",
+            "test_nll_per_base":  "Test NLL/base",
+            "test_perplexity":    "Perplexity",
+            "test_elbo_per_base": "Test ELBO/base",
+        })
+    )
+    for c in ["Test NLL/base", "Perplexity", "Test ELBO/base"]:
+        _rank_vi[c] = _rank_vi[c].map("{:.4g}".format)
+    itshow(_rank_vi, paging=True, pageLength=16, searching=True)
+except ImportError:
+    Markdown(
+        vi.assign(
+            rank=vi.groupby("platform")["test_nll_per_base"].rank(method="first").astype(int)
+        )
+        .sort_values(["platform", "rank"])
+        [["platform_label","rank","model_id","model_type_label","context_length",
+          "test_nll_per_base","test_elbo_per_base"]]
+        .to_markdown(index=False, floatfmt=".4g")
+    )
+```
+
+### Cross-platform winner summary
+
+```{python}
+#| label: fig-winner-heatmap
+#| fig-cap: "Rank of each model on each platform by test NLL (MLE). Rank 1 = best."
+#| fig-alt: "Heatmap of model rank per platform, lower is better."
+
+_rank_pivot = (
+    mle.assign(
+        rank=mle.groupby("platform")["test_nll_per_base"].rank(method="first").astype(int)
+    )
+    .pivot_table(index="model_id", columns="platform_label", values="rank")
+)
+_col_ord = [_platform_labels[p] for p in PLATFORM_ORDER if _platform_labels[p] in _rank_pivot.columns]
+_rank_pivot = _rank_pivot[_col_ord]
+
+# Row order: combinatorial by length, then additive by length
+_row_meta = (
+    mle[["model_id", "model_type", "context_length"]]
+    .drop_duplicates()
+    .sort_values(["model_type", "context_length"])
+)
+_row_ord = [r for r in _row_meta["model_id"].tolist() if r in _rank_pivot.index]
+_rank_pivot = _rank_pivot.loc[_row_ord]
+
+fig = go.Figure(go.Heatmap(
+    z=_rank_pivot.to_numpy(),
+    x=_rank_pivot.columns.tolist(),
+    y=_rank_pivot.index.tolist(),
+    colorscale="RdYlGn",
+    reversescale=True,
+    zmin=1,
+    zmax=int(_rank_pivot.to_numpy().max()),
+    colorbar=dict(title="Rank"),
+    hovertemplate="model=%{y}<br>platform=%{x}<br>rank=%{z}<extra></extra>",
+    text=_rank_pivot.to_numpy().astype(int),
+    texttemplate="%{text}",
+))
+fig.update_layout(
+    template="plotly_white",
+    title="MLE model rank by test NLL per platform (1 = best)",
+    xaxis_title="Platform",
+    yaxis_title="Model",
+    height=max(300, 28 * len(_row_ord)),
+)
+fig.show()
+```
+
+```{python}
+#| label: fig-winner-heatmap-vi
+#| fig-cap: "Rank of each VI model on each platform by test NLL. Rank 1 = best."
+#| fig-alt: "Heatmap of VI model rank per platform."
+
+_vrank_pivot = (
+    vi.assign(
+        rank=vi.groupby("platform")["test_nll_per_base"].rank(method="first").astype(int)
+    )
+    .pivot_table(index="model_id", columns="platform_label", values="rank")
+)
+_vcol_ord = [_platform_labels[p] for p in PLATFORM_ORDER if _platform_labels[p] in _vrank_pivot.columns]
+_vrank_pivot = _vrank_pivot[_vcol_ord]
+
+_vrow_meta = (
+    vi[["model_id", "model_type", "context_length"]]
+    .drop_duplicates()
+    .sort_values(["model_type", "context_length"])
+)
+_vrow_ord = [r for r in _vrow_meta["model_id"].tolist() if r in _vrank_pivot.index]
+_vrank_pivot = _vrank_pivot.loc[_vrow_ord]
+
+fig = go.Figure(go.Heatmap(
+    z=_vrank_pivot.to_numpy(),
+    x=_vrank_pivot.columns.tolist(),
+    y=_vrank_pivot.index.tolist(),
+    colorscale="RdYlGn",
+    reversescale=True,
+    zmin=1,
+    zmax=int(_vrank_pivot.to_numpy().max()),
+    colorbar=dict(title="Rank"),
+    hovertemplate="model=%{y}<br>platform=%{x}<br>rank=%{z}<extra></extra>",
+    text=_vrank_pivot.to_numpy().astype(int),
+    texttemplate="%{text}",
+))
+fig.update_layout(
+    template="plotly_white",
+    title="VI model rank by test NLL per platform (1 = best)",
+    xaxis_title="Platform",
+    yaxis_title="Model",
+    height=max(300, 28 * len(_vrow_ord)),
+)
+fig.show()
+```
+
+## Predicted Marginal Error Rates
+
+Each model's parameters define a probability distribution over error types for every
+possible sequence context.  To obtain a single summary rate per model, these
+per-context distributions are **marginalized uniformly** over all 4^L possible
+contexts of length L (the prior over sequence context is assumed uniform).
+
+For models with L ≤ 10 (all combinatorial and most additive models), every context
+is enumerated exactly.  For additive models with L > 10, 200 000 contexts are drawn
+at random (Monte Carlo; variance ≲ 0.01 %).  MLE and VI posterior-mean parameters
+are treated identically.
+
+```{python}
+#| code-fold: true
+#| code-summary: "Marginal error rate computation"
+import torch
+
+_N_MC = 200_000
+_ERROR_LABELS = (
+    "match",
+    "sub_to_A", "sub_to_C", "sub_to_G", "sub_to_T",
+    "ins_A", "ins_C", "ins_G", "ins_T",
+    "deletion",
+)
+_SUB_LABELS = ("sub_to_A", "sub_to_C", "sub_to_G", "sub_to_T")
+_INS_LABELS = ("ins_A", "ins_C", "ins_G", "ins_T")
+
+
+def _load_artifact(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _softmax_np(x):
+    s = x - x.max(axis=-1, keepdims=True)
+    e = np.exp(s)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _compose_logits_np(params, context_length, ctx_indices):
+    """Return logits[n_ctx, n_err] for the given context indices."""
+    n_err = len(_ERROR_LABELS)
+    if "logits" in params:
+        logits = params["logits"].detach().cpu().numpy().reshape(-1, n_err)
+        return logits[ctx_indices]
+    # additive_context
+    intercept  = params["intercept_logits"].detach().cpu().numpy()        # [E]
+    base_logits = params["base_logits"].detach().cpu().numpy()             # [L, B, E]
+    n_bases = base_logits.shape[1]
+    base_logits = base_logits - base_logits.mean(axis=1, keepdims=True)   # center
+    n_ctx = len(ctx_indices)
+    bm = np.empty((n_ctx, context_length), dtype=np.int32)
+    for pos in range(context_length):
+        div = int(n_bases) ** (context_length - pos - 1)
+        bm[:, pos] = (ctx_indices // div) % n_bases
+    logits = np.broadcast_to(intercept, (n_ctx, n_err)).copy()
+    for pos in range(context_length):
+        logits += base_logits[pos, bm[:, pos], :]
+    return logits
+
+
+def _n_bases_for_artifact(artifact, params):
+    """Return number of DNA bases the model uses (4 or 5)."""
+    if "base_logits" in params:
+        return int(params["base_logits"].shape[1])
+    context_length = int(artifact.get("context_length", 1))
+    n_ctx = int(params["logits"].numel()) // len(_ERROR_LABELS)
+    for nb in (4, 5):
+        if nb ** context_length == n_ctx:
+            return nb
+    return 4
+
+
+def _marginal_probs(artifact, n_mc=_N_MC):
+    """Return {inference_key: ndarray[n_err]} of marginal probabilities."""
+    context_length = int(artifact.get("context_length", 1))
+    out = {}
+    for inf_key, param_key in [
+        ("maximum_likelihood",  "params"),
+        ("variational_inference", "params_mean"),
+    ]:
+        raw    = artifact.get(inf_key, {})
+        params = raw.get(param_key, {})
+        if not params:
+            continue
+        n_bases = _n_bases_for_artifact(artifact, params)
+        total   = n_bases ** context_length
+        if total <= 1_048_576:          # ≤ 4^10 → full enumeration
+            ctx_idx = np.arange(total, dtype=np.int64)
+        else:                           # Monte Carlo
+            rng = np.random.default_rng(42)
+            sampled = rng.integers(0, n_bases, size=(n_mc, context_length))
+            mults   = n_bases ** np.arange(context_length - 1, -1, -1, dtype=np.int64)
+            ctx_idx = (sampled.astype(np.int64) * mults).sum(axis=1)
+        logits = _compose_logits_np(params, context_length, ctx_idx)
+        out[inf_key] = _softmax_np(logits).mean(axis=0)   # [n_err]
+    return out
+
+
+# ── Load artifacts and compute marginal rates ─────────────────────────────────
+_artifact_paths = sorted(RESULTS_DIR.glob("*.pt"))
+_marg_rows = []
+for _path in _artifact_paths:
+    _art = _load_artifact(_path)
+    _mp  = _marginal_probs(_art)
+    _base = {
+        "model_id":       str(_art.get("model_id") or _art.get("model", _path.stem)),
+        "model_type":     str(_art.get("model_type") or _art.get("parameterization", "")),
+        "platform":       str(_art.get("platform", "")),
+        "context_length": int(_art.get("context_length", 0)),
+    }
+    for inf_key, probs in _mp.items():
+        row = dict(**_base, inference=inf_key)
+        row.update(dict(zip(_ERROR_LABELS, probs.tolist())))
+        row["error_rate"]        = float(1.0 - probs[_ERROR_LABELS.index("match")])
+        row["substitution_rate"] = float(sum(probs[_ERROR_LABELS.index(e)] for e in _SUB_LABELS))
+        row["insertion_rate"]    = float(sum(probs[_ERROR_LABELS.index(e)] for e in _INS_LABELS))
+        row["deletion_rate"]     = float(probs[_ERROR_LABELS.index("deletion")])
+        _marg_rows.append(row)
+    del _art
+
+marg = pd.DataFrame(_marg_rows)
+marg["model_type_label"] = marg["model_type"].map(_type_labels).fillna(marg["model_type"])
+marg["inference_label"]  = marg["inference"].map(_infer_labels).fillna(marg["inference"])
+marg["platform_label"]   = pd.Categorical(
+    marg["platform"].map(_platform_labels).fillna(marg["platform"]),
+    categories=PLATFORM_LABELS_ORDERED, ordered=True,
+)
+
+marg_mle = marg[marg["inference"] == "maximum_likelihood"].copy()
+print(f"Marginal rates computed for {len(marg_mle)} (model, platform) MLE pairs.")
+```
+
+### Summary table (MLE)
+
+```{python}
+#| echo: false
+#| label: tbl-marg-summary
+#| tbl-cap: "Predicted marginal error rates per model and dataset (MLE parameters, uniform context marginalisation). Rates shown as percentages."
+
+_cols = ["platform_label", "model_id", "model_type_label", "context_length",
+         "error_rate", "substitution_rate", "insertion_rate", "deletion_rate"]
+_tbl = (
+    marg_mle.sort_values(["platform", "model_type", "context_length"])
+    [_cols]
+    .rename(columns={
+        "platform_label":    "Platform",
+        "model_id":          "Model",
+        "model_type_label":  "Type",
+        "context_length":    "Context",
+        "error_rate":        "Error %",
+        "substitution_rate": "Sub %",
+        "insertion_rate":    "Ins %",
+        "deletion_rate":     "Del %",
+    })
+)
+for c in ("Error %", "Sub %", "Ins %", "Del %"):
+    _tbl[c] = (_tbl[c] * 100).map("{:.3f}".format)
+
+try:
+    from itables import show as itshow
+    itshow(_tbl, paging=True, pageLength=20, searching=True)
+except ImportError:
+    Markdown(_tbl.to_markdown(index=False))
+```
+
+### Overall error rate vs context length
+
+```{python}
+#| label: fig-marg-error-rate
+#| fig-cap: "Predicted marginal error rate (uniform context distribution) by context length and model type, faceted by platform."
+#| fig-alt: "Line plots of marginal error rate versus context length, one facet per platform."
+
+fig = px.line(
+    marg.sort_values(["platform", "context_length"]),
+    x="context_length",
+    y="error_rate",
+    color="model_type_label",
+    symbol="model_type_label",
+    line_dash="inference_label",
+    markers=True,
+    facet_col="platform_label",
+    hover_data=["model_id", "substitution_rate", "insertion_rate", "deletion_rate"],
+    labels={
+        "context_length":    "Context length",
+        "error_rate":        "Error rate",
+        "model_type_label":  "Model type",
+        "inference_label":   "Inference",
+    },
+    title="Predicted marginal error rate",
+    color_discrete_map={
+        "Combinatorial": px.colors.qualitative.Plotly[0],
+        "Additive":      px.colors.qualitative.Plotly[1],
+    },
+)
+fig.update_layout(template="plotly_white", height=380, legend_title_text="Model type")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None,
+                 tickformat=".2%", hoverformat=".4%")
+fig.update_xaxes(title_text="", dtick=2)
+fig.show()
+```
+
+### Error type breakdown vs context length (MLE)
+
+```{python}
+#| label: fig-marg-breakdown
+#| fig-cap: "Predicted marginal rates per error group (substitution / insertion / deletion) by context length, MLE only."
+#| fig-alt: "Line plots of sub, ins, and del marginal rates versus context length, faceted by platform."
+
+_melt = marg_mle.melt(
+    id_vars=["platform", "platform_label", "model_id", "model_type", "model_type_label", "context_length"],
+    value_vars=["substitution_rate", "insertion_rate", "deletion_rate"],
+    var_name="error_group",
+    value_name="rate",
+)
+_melt["error_group"] = _melt["error_group"].map({
+    "substitution_rate": "Substitution",
+    "insertion_rate":    "Insertion",
+    "deletion_rate":     "Deletion",
+})
+
+fig = px.line(
+    _melt.sort_values(["platform", "context_length"]),
+    x="context_length",
+    y="rate",
+    color="error_group",
+    symbol="model_type_label",
+    line_dash="model_type_label",
+    markers=True,
+    facet_col="platform_label",
+    hover_data=["model_id"],
+    labels={
+        "context_length":   "Context length",
+        "rate":             "Rate",
+        "error_group":      "Error group",
+        "model_type_label": "Model type",
+    },
+    title="Marginal rates by error group (MLE)",
+    color_discrete_map={
+        "Substitution": "#EE6677",
+        "Insertion":    "#228833",
+        "Deletion":     "#CCBB44",
+    },
+)
+fig.update_layout(template="plotly_white", height=380, legend_title_text="Error group")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+fig.update_yaxes(title_text="", matches=None, tickformat=".2%", hoverformat=".4%")
+fig.update_xaxes(title_text="", dtick=2)
+fig.show()
+```
+
+### Per-error-type rates (MLE)
+
+One heatmap per platform.  Rows are models (sorted by type then context length);
+columns are the nine non-match error types.  Colour encodes the predicted marginal
+probability; values within each cell are shown as percentages.
+
+```{python}
+#| label: fig-marg-heatmap
+#| fig-cap: "Predicted marginal probability for each error type and model (MLE, uniform marginalisation). Values in %."
+#| fig-alt: "Heatmap of per-error-type marginal rates across models and platforms."
+
+from plotly.subplots import make_subplots
+
+_err_cols  = [e for e in _ERROR_LABELS if e != "match"]
+_err_nice  = [e.replace("sub_to_", "→").replace("ins_", "+").replace("deletion", "del")
+              for e in _err_cols]
+
+_model_order = (
+    marg_mle[["model_id", "model_type", "context_length"]]
+    .drop_duplicates()
+    .sort_values(["model_type", "context_length"])
+    ["model_id"]
+    .tolist()
+)
+
+_platforms = PLATFORM_LABELS_ORDERED
+_n_plt = len(_platforms)
+fig = make_subplots(
+    rows=_n_plt, cols=1,
+    subplot_titles=_platforms,
+    vertical_spacing=0.06,
+)
+
+for _pi, _plt_lbl in enumerate(_platforms):
+    _sub = (
+        marg_mle[marg_mle["platform_label"] == _plt_lbl]
+        .set_index("model_id")[_err_cols]
+    )
+    _sub = _sub.reindex(_model_order).dropna(how="all")
+    _vals    = _sub.to_numpy() * 100          # in %
+    _text    = np.where(
+        np.isfinite(_vals),
+        np.vectorize(lambda v: f"{v:.3f}")(np.where(np.isfinite(_vals), _vals, 0)),
+        "",
+    )
+    fig.add_trace(
+        go.Heatmap(
+            z=_vals,
+            x=_err_nice,
+            y=_sub.index.tolist(),
+            colorscale="Blues",
+            showscale=(_pi == 0),
+            colorbar=dict(title="%", len=0.25, y=0.87),
+            text=_text,
+            texttemplate="%{text}",
+            hovertemplate="model=%{y}<br>error=%{x}<br>rate=%{z:.4f}%<extra></extra>",
+            zmin=0,
+        ),
+        row=_pi + 1, col=1,
+    )
+
+fig.update_layout(
+    template="plotly_white",
+    title="Marginal error-type rates by model and platform (MLE, %)",
+    height=max(400, 110 * _n_plt + 30 * len(_model_order)),
+)
+fig.update_xaxes(tickangle=-45)
+fig.show()
+```
+
+## Notes
+
+- **Test NLL per base** — negative log-likelihood on held-out data divided by
+  the number of test observations.  Directly comparable between MLE and VI
+  models (VI NLL uses the posterior-mean parameters, not the ELBO).
+- **AIC** — penalises model complexity; only defined for MLE fits.  Additive
+  models use far fewer parameters than combinatorial models at the same context
+  length, so their AIC curves frequently cross at moderate lengths.
+- **ΔAIC / ΔNLL** — excess above the best model within a platform; 0 = best.
+  Log scale on ΔAIC highlights near-equivalent models near the minimum.
+- **Akaike weight** — relative evidence for each MLE model on a platform;
+  a weight near 1 indicates a decisive winner.
+- **Test ELBO per base** — a lower bound on the test log-likelihood for VI
+  models; higher (less negative) is better.
+- **Marginal error rate** — the average predicted error probability over a
+  uniform distribution of sequence contexts (all 4^L equally likely).  For
+  additive models with L > 10 this average is estimated by Monte Carlo (N = 200 000).
+  The marginal is an intrinsic property of the model, not a property of the data.

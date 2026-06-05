@@ -14,3 +14,19 @@ bincode = "1"
 serde = { version = "1", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 rand = "0.9.2"
+# Fast, deterministic hasher for the hot u64-keyed maps (count map, neighbours,
+# reference consensus). std's SipHash was ~30% of CPU when profiled; FxHash is
+# deterministic so byte-identical outputs are preserved.
+rustc-hash = "2"
+# Heap profiler, only compiled in when the `dhat-heap` feature is enabled.
+dhat = { version = "0.3", optional = true }
+
+[features]
+# Enable the dhat heap profiler as the global allocator. Build/run with
+# `--features dhat-heap`; writes dhat-heap.json on exit. Off by default so
+# normal builds keep the system allocator.
+dhat-heap = ["dep:dhat"]
+
+# Line numbers in release call stacks for profilers (dhat / Instruments).
+[profile.release]
+debug = 1

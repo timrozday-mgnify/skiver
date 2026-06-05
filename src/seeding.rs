@@ -25,8 +25,8 @@ SOFTWARE.
 */
 
 use crate::types::*;
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[inline]
 pub fn mm_hash64_masked(kmer: u64, mask: Option<u64>) -> u64 {
@@ -44,7 +44,6 @@ pub fn mm_hash64_masked(kmer: u64, mask: Option<u64>) -> u64 {
     key = key.wrapping_add(key << 31);
     key
 }
-
 
 pub fn decode(byte: u64) -> u8 {
     if byte == 0 {
@@ -87,6 +86,7 @@ pub fn fmh_seeds_masked(
     k: usize,
     v: usize,
     bidirectional: bool,
+    read_id: u64,
 ) {
     type MarkerBits = u64;
     if string.len() < k + v {
@@ -97,7 +97,6 @@ pub fn fmh_seeds_masked(
     let mut rolling_key_r: MarkerBits = 0;
     let mut rolling_value_f: MarkerBits = 0;
     let mut rolling_value_r: MarkerBits = 0;
-
 
     let key_mask = (1u64 << (2 * k)) - 1;
     let value_mask = (1u64 << (2 * v)) - 1;
@@ -140,7 +139,6 @@ pub fn fmh_seeds_masked(
     // Iterate through the string
     for i in k + v - 1..len {
         let nuc_f = BYTE_TO_SEQ[string[i] as usize] as u64;
-        
 
         // append the first base of the value to the key
         let first_base_v = (rolling_value_f >> (2 * (v - 1))) & 0b11;
@@ -158,12 +156,16 @@ pub fn fmh_seeds_masked(
         if hash_f < threshold_marker {
             keys_vec.push(rolling_key_f as u64);
             values_vec.push(rolling_value_f as u64);
-            value_info_vec.push(ValueInfo { qual: vec![], start_index: (i - v + 1) as u32, dist_to_read_end: len as u32 - (i - v + 1) as u32, is_forward: true });
+            value_info_vec.push(ValueInfo {
+                qual: vec![],
+                start_index: (i - v + 1) as u32,
+                dist_to_read_end: len as u32 - (i - v + 1) as u32,
+                is_forward: true,
+                read_id,
+            });
         }
 
         if bidirectional {
-            //let nuc_value_r = 3 - BYTE_TO_SEQ[string[i + v - 1] as usize] as u64;
-            //let nuc_key_r = 3 - BYTE_TO_SEQ[string[i + k + v - 1] as usize] as u64;
             let nuc_r = 3 - nuc_f;
 
             let last_base_k = rolling_key_r & 0b11;
@@ -176,13 +178,17 @@ pub fn fmh_seeds_masked(
             rolling_key_r |= nuc_r << (2 * (k - 1));
             rolling_key_r &= key_mask;
 
-
-
             let hash_r = mm_hash64_masked(rolling_key_r, None);
             if hash_r < threshold_marker {
                 keys_vec.push(rolling_key_r as u64);
                 values_vec.push(rolling_value_r as u64);
-                value_info_vec.push(ValueInfo { qual: vec![], start_index: (i - k + 1) as u32, dist_to_read_end: len as u32 - (i - k + 1) as u32, is_forward: false });
+                value_info_vec.push(ValueInfo {
+                    qual: vec![],
+                    start_index: (i - k + 1) as u32,
+                    dist_to_read_end: len as u32 - (i - k + 1) as u32,
+                    is_forward: false,
+                    read_id,
+                });
             }
         }
     }
@@ -207,6 +213,7 @@ pub fn fmh_seeds_masked_with_qual(
     k: usize,
     v: usize,
     bidirectional: bool,
+    read_id: u64,
 ) {
     type MarkerBits = u64;
     if string.len() < k + v {
@@ -269,7 +276,13 @@ pub fn fmh_seeds_masked_with_qual(
             keys_vec.push(rolling_key_f);
             values_vec.push(rolling_value_f);
             // Value covers read positions [i-v+1, i]; position 0 = i-v+1.
-            value_info_vec.push(ValueInfo { qual: qual[i - v + 1..=i].to_vec(), start_index: (i - v + 1) as u32, dist_to_read_end: len as u32 - (i - v + 1) as u32, is_forward: true });
+            value_info_vec.push(ValueInfo {
+                qual: qual[i - v + 1..=i].to_vec(),
+                start_index: (i - v + 1) as u32,
+                dist_to_read_end: len as u32 - (i - v + 1) as u32,
+                is_forward: true,
+                read_id,
+            });
         }
 
         if bidirectional {
@@ -291,7 +304,13 @@ pub fn fmh_seeds_masked_with_qual(
                 // RC value position p corresponds to forward read position (i-k-p).
                 // Quality string is in RC-value-position order: p=0 → qual[i-k].
                 let rc_qual: Vec<u8> = (0..v).map(|p| qual[i - k - p]).collect();
-                value_info_vec.push(ValueInfo { qual: rc_qual, start_index: (i - k + 1) as u32, dist_to_read_end: len as u32 - (i - k + 1) as u32, is_forward: false });
+                value_info_vec.push(ValueInfo {
+                    qual: rc_qual,
+                    start_index: (i - k + 1) as u32,
+                    dist_to_read_end: len as u32 - (i - k + 1) as u32,
+                    is_forward: false,
+                    read_id,
+                });
             }
         }
     }
@@ -332,7 +351,7 @@ pub fn count_seeds_in_set(
             rolling_kmer_r_marker |= nuc_r << marker_reverse_shift_dist;
         }
     }
-    for i in marker_k-1..len {
+    for i in marker_k - 1..len {
         let nuc_byte = string[i] as usize;
         let nuc_f = BYTE_TO_SEQ[nuc_byte] as u64;
         let nuc_r = 3 - nuc_f;
@@ -346,7 +365,7 @@ pub fn count_seeds_in_set(
         if bidirectional {
             rolling_kmer_r_marker >>= 2;
             rolling_kmer_r_marker &= marker_rev_mask;
-            rolling_kmer_r_marker |= nuc_r << marker_reverse_shift_dist;    
+            rolling_kmer_r_marker |= nuc_r << marker_reverse_shift_dist;
 
             if kmer_set.contains(&rolling_kmer_r_marker) {
                 *kmer_count.entry(rolling_kmer_r_marker).or_insert(0) += 1;
@@ -354,5 +373,3 @@ pub fn count_seeds_in_set(
         }
     }
 }
-
-        

@@ -1,29 +1,32 @@
 use clap::Parser;
 
-
-use skiver::cmdline::*;
 use skiver::analyze;
-use skiver::sketch;
-use skiver::mapping;
+use skiver::cmdline::*;
 use skiver::dump;
-
+use skiver::mapping;
+use skiver::sketch;
 
 //Use this allocator when statically compiling
 //instead of the default
 //because the musl statically compiled binary
 //uses a bad default allocator which makes the
 //binary take 60% longer!!! Only affects
-//static compilation though. 
-#[cfg(target_env = "musl")]
+//static compilation though.
+#[cfg(all(target_env = "musl", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Heap profiling: when built with `--features dhat-heap`, dhat replaces the
+// global allocator and records every allocation, writing dhat-heap.json on
+// exit. View at https://nnethercote.github.io/dh_view/dh_view.html and sort by
+// "At t-gmax (bytes)" to find peak-memory culprits.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() {
-//    set_hook(Box::new(|info| {
-//        if let Some(s) = info.payload().downcast_ref::<String>() {
-//            log::error!("{}", s);
-//        }
-//    }));
+    #[cfg(feature = "dhat-heap")]
+    let _dhat_profiler = dhat::Profiler::new_heap();
 
     let cli = Cli::parse();
     match cli.mode {

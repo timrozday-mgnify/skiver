@@ -14,21 +14,27 @@ import torch
 
 from .context_error_models import (
     BASE_TO_IDX,
+    MISSING_CONTEXT_BASE,
     NUM_CONTEXT_BASES,
+    NUM_TRUE_BASE_BINS,
+    UNKNOWN_TRUE_BASE_BIN,
     ContextCounts,
     ContextLengthScreenCounts,
     PreviousBasesErrorModel,
     ProgressCallback,
-    _normalise_base,
+    _normalise_context_base,
     _parse_bool,
 )
 from .encoding import NUM_ERROR_TYPES, encode_error_type
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 4
 CACHE_KIND: Final[str] = "context_row_cache"
 ROW_CHUNK_SIZE: Final[int] = 1_000_000
+AGGREGATE_CHUNK_ROWS: Final[int] = 10_000_000
+_OBS_START_SCAN_BATCH: Final[int] = 4096
+_OBS_START_SCAN_CAP: Final[int] = 1_000_000
 
 
 def cache_path(
@@ -242,10 +248,22 @@ def _append_tsv_rows(
 
             obs_id = int(row["obs_id"])
             obs_start = int(obs_id != current_obs_id)
+            prev_base = _normalise_context_base(row["prev_base"])
+            if prev_base is None:
+                skipped_rows += 1
+                skipped_since_callback += 1
+                if scanned_since_callback >= progress_interval:
+                    flush_progress()
+                continue
             current_obs_id = obs_id
+            true_base = _normalise_context_base(row["true_base"])
             batch["obs_start"].append(obs_start)
-            batch["prev_base"].append(BASE_TO_IDX[_normalise_base(row["prev_base"])])
-            batch["true_base"].append(BASE_TO_IDX[_normalise_base(row["true_base"])])
+            batch["prev_base"].append(BASE_TO_IDX[prev_base])
+            batch["true_base"].append(
+                BASE_TO_IDX[true_base]
+                if true_base is not None
+                else MISSING_CONTEXT_BASE
+            )
             batch["target"].append(
                 encode_error_type(row["true_base"], row["obs_base"], row["edit_op"])
             )
@@ -271,82 +289,275 @@ def _aggregate_row_cache(
     progress_callback: ProgressCallback | None,
     progress_interval: int,
 ) -> ContextLengthScreenCounts:
-    """Aggregate previous-base context counts from encoded row datasets."""
+    """Aggregate previous-base context counts from encoded row datasets.
+
+    Streams the HDF5 datasets in observation-aligned chunks of roughly
+    ``AGGREGATE_CHUNK_ROWS`` rows, accumulating per-context-length counts into
+    pre-allocated flat int64 buffers. Result is bit-identical to a single-shot
+    aggregation because rolling context only depends on the last
+    ``context_length`` events within the current observation, and chunks always
+    end strictly before the next observation start.
+    """
+    del progress_interval  # chunked loop drives progress directly
     if not context_lengths:
         raise ValueError("context_lengths must not be empty")
     models = [PreviousBasesErrorModel(length) for length in context_lengths]
-    count_tensors = {
-        model.context_length: torch.zeros(
-            *model.context_shape,
-            NUM_ERROR_TYPES,
-            dtype=torch.float32,
+    rows_group = handle["rows"]
+    cache_skipped_rows = int(handle.attrs["skipped_rows"])
+    row_count = int(rows_group["target"].shape[0])
+
+    obs_start_ds = rows_group["obs_start"]
+    prev_base_ds = rows_group["prev_base"]
+    true_base_ds = rows_group["true_base"]
+    target_ds = rows_group["target"]
+
+    flat_counts: dict[int, np.ndarray] = {
+        model.context_length: np.zeros(
+            NUM_CONTEXT_BASES**model.context_length
+            * NUM_TRUE_BASE_BINS
+            * NUM_ERROR_TYPES,
+            dtype=np.int64,
         )
         for model in models
     }
 
-    rows_group = handle["rows"]
-    total_observations = int(handle.attrs["total_observations"])
-    skipped_rows = int(handle.attrs["skipped_rows"])
-    row_count = int(rows_group["target"].shape[0])
-    history: list[int] = []
-    scanned_since_callback = 0
+    rows_seen = 0
+    start = 0
+    while start < row_count:
+        end = _find_next_obs_start(
+            obs_start_ds,
+            row_count,
+            start + AGGREGATE_CHUNK_ROWS,
+        )
+        obs_starts = obs_start_ds[start:end][:].astype(bool, copy=False)
+        prev_bases = prev_base_ds[start:end][:]
+        true_bases = true_base_ds[start:end][:]
+        targets = target_ds[start:end][:]
 
-    for start in range(0, row_count, progress_interval):
-        stop = min(start + progress_interval, row_count)
-        obs_starts = rows_group["obs_start"][start:stop]
-        prev_bases = rows_group["prev_base"][start:stop]
-        true_bases = rows_group["true_base"][start:stop]
-        targets = rows_group["target"][start:stop]
-
-        for obs_start, prev_base, true_base, target in zip(
+        event_bases, row_event_ends, available_history = _row_cache_context_events(
             obs_starts,
             prev_bases,
             true_bases,
-            targets,
-            strict=True,
-        ):
-            if obs_start:
-                history = [int(prev_base)]
-            for model in models:
-                context_idx = _context_index_from_encoded_history(
-                    history,
-                    model.context_length,
-                )
-                count_tensors[model.context_length][context_idx, int(target)] += 1
-            if int(true_base) != BASE_TO_IDX["N"]:
-                history.append(int(true_base))
+        )
+        for model in models:
+            _accumulate_context_length_flat(
+                flat_counts[model.context_length],
+                event_bases,
+                row_event_ends,
+                available_history,
+                true_bases,
+                targets,
+                model.context_length,
+            )
 
-        scanned_since_callback += stop - start
+        del obs_starts, prev_bases, true_bases, targets
+        del event_bases, row_event_ends, available_history
+
+        chunk_rows = end - start
+        rows_seen += chunk_rows
         if progress_callback is not None:
-            progress_callback(path, scanned_since_callback, scanned_since_callback, 0)
-            scanned_since_callback = 0
+            progress_callback(path, chunk_rows, chunk_rows, 0)
+        start = end
 
     by_length = {}
     for model in models:
-        counts = count_tensors[model.context_length]
-        context_totals = counts.sum(dim=-1)
-        by_length[model.context_length] = ContextCounts(
-            counts=counts,
+        cl = model.context_length
+        shape = (
+            NUM_CONTEXT_BASES**cl,
+            NUM_TRUE_BASE_BINS,
+            NUM_ERROR_TYPES,
+        )
+        counts_np = flat_counts[cl].reshape(shape)
+        total_observations = int(counts_np.sum())
+        context_totals = counts_np.reshape(shape[0], -1).sum(axis=-1)
+        counts_tensor = torch.from_numpy(
+            counts_np.astype(np.float32, copy=False)
+        )
+        by_length[cl] = ContextCounts(
+            counts=counts_tensor,
             run_values=None,
             total_observations=total_observations,
-            skipped_rows=skipped_rows,
-            low_count_contexts=int((context_totals < 10).sum().item()),
+            skipped_rows=cache_skipped_rows + row_count - total_observations,
+            low_count_contexts=int((context_totals < 10).sum()),
             context_shape=model.context_shape,
             scalar_run=False,
         )
 
     return ContextLengthScreenCounts(
         by_length=by_length,
-        total_observations=total_observations,
-        skipped_rows=skipped_rows,
+        total_observations=row_count,
+        skipped_rows=cache_skipped_rows,
     )
+
+
+def _find_next_obs_start(obs_start_ds: object, row_count: int, target: int) -> int:
+    """Return the first row index >= ``target`` where ``obs_start`` is True.
+
+    Probes the HDF5 dataset forward in small batches. If the target is at or
+    past the dataset end, returns ``row_count``. Falls back to ``row_count``
+    after scanning ``_OBS_START_SCAN_CAP`` rows without finding a True (covers
+    pathological inputs with no further observation starts).
+    """
+    if target >= row_count:
+        return row_count
+    pos = int(target)
+    scanned = 0
+    while pos < row_count and scanned < _OBS_START_SCAN_CAP:
+        end = min(pos + _OBS_START_SCAN_BATCH, row_count)
+        batch = obs_start_ds[pos:end][:].astype(bool, copy=False)
+        hits = np.flatnonzero(batch)
+        if hits.size > 0:
+            return pos + int(hits[0])
+        scanned += end - pos
+        pos = end
+    return row_count
+
+
+def _accumulate_context_length_flat(
+    flat_counts: np.ndarray,
+    event_bases: np.ndarray,
+    row_event_ends: np.ndarray,
+    available_history: np.ndarray,
+    true_bases: np.ndarray,
+    targets: np.ndarray,
+    context_length: int,
+) -> None:
+    """Add a chunk's context-by-error counts into ``flat_counts`` in place.
+
+    ``flat_counts`` is a 1-D ``int64`` buffer with shape
+    ``(NUM_CONTEXT_BASES**context_length * NUM_TRUE_BASE_BINS * NUM_ERROR_TYPES,)``.
+    """
+    if targets.size == 0:
+        return
+    valid_rows = available_history >= context_length
+    if not np.any(valid_rows):
+        return
+    context_codes_by_end = _rolling_context_codes(event_bases, context_length)
+    context_indices = context_codes_by_end[row_event_ends[valid_rows]]
+    true_base_bins = true_bases[valid_rows].astype(np.int64, copy=False)
+    true_base_bins = np.where(
+        true_base_bins == MISSING_CONTEXT_BASE,
+        UNKNOWN_TRUE_BASE_BIN,
+        true_base_bins,
+    )
+    combined_indices = (
+        context_indices.astype(np.int64, copy=False)
+        * NUM_TRUE_BASE_BINS
+        * NUM_ERROR_TYPES
+        + true_base_bins * NUM_ERROR_TYPES
+        + targets[valid_rows].astype(np.int64, copy=False)
+    )
+    chunk_counts = np.bincount(combined_indices, minlength=flat_counts.size)
+    if chunk_counts.size == flat_counts.size:
+        flat_counts += chunk_counts
+    else:
+        flat_counts[: chunk_counts.size] += chunk_counts
+
+
+def _row_cache_context_events(
+    obs_starts: np.ndarray,
+    prev_bases: np.ndarray,
+    true_bases: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return context event stream and per-row history metadata.
+
+    Each observation contributes its row-level ``prev_base`` before the first
+    row. Rows with A/C/G/T true bases contribute that base after the row. Gap
+    rows remain valid targets but do not extend history.
+    """
+    row_count = int(true_bases.shape[0])
+    if row_count == 0:
+        empty = np.array([], dtype=np.int64)
+        return empty.astype(np.uint8), empty, empty
+    if not bool(obs_starts[0]):
+        raise ValueError("HDF5 row cache must mark the first row as an observation start")
+
+    true_is_context = true_bases != MISSING_CONTEXT_BASE
+    obs_events_before_or_at_row = np.cumsum(obs_starts, dtype=np.int64)
+    true_events_before_or_at_row = np.cumsum(true_is_context, dtype=np.int64)
+    true_events_before_row = true_events_before_or_at_row.copy()
+    true_events_before_row -= true_is_context.astype(np.int64)
+    row_event_ends = obs_events_before_or_at_row + true_events_before_row
+
+    event_count = int(obs_events_before_or_at_row[-1] + true_events_before_or_at_row[-1])
+    event_bases = np.empty(event_count, dtype=np.uint8)
+    event_bases[row_event_ends[obs_starts] - 1] = prev_bases[obs_starts]
+    true_event_positions = obs_events_before_or_at_row + true_events_before_or_at_row
+    event_bases[true_event_positions[true_is_context] - 1] = true_bases[
+        true_is_context
+    ]
+
+    obs_ids = obs_events_before_or_at_row - 1
+    obs_start_rows = np.flatnonzero(obs_starts)
+    obs_event_starts = row_event_ends[obs_start_rows] - 1
+    available_history = row_event_ends - obs_event_starts[obs_ids]
+    return event_bases, row_event_ends, available_history
+
+
+def _aggregate_context_length_from_events(
+    event_bases: np.ndarray,
+    row_event_ends: np.ndarray,
+    available_history: np.ndarray,
+    true_bases: np.ndarray,
+    targets: np.ndarray,
+    context_length: int,
+) -> torch.Tensor:
+    """Return dense context-by-error counts for one previous-base length."""
+    context_count = NUM_CONTEXT_BASES**context_length
+    counts_shape = (context_count, NUM_TRUE_BASE_BINS, NUM_ERROR_TYPES)
+    if targets.size == 0:
+        return torch.zeros(*counts_shape, dtype=torch.float32)
+
+    valid_rows = available_history >= context_length
+    if not np.any(valid_rows):
+        return torch.zeros(*counts_shape, dtype=torch.float32)
+
+    context_codes_by_end = _rolling_context_codes(event_bases, context_length)
+    context_indices = context_codes_by_end[row_event_ends[valid_rows]]
+    true_base_bins = true_bases[valid_rows].astype(np.int64, copy=False)
+    true_base_bins = np.where(
+        true_base_bins == MISSING_CONTEXT_BASE,
+        UNKNOWN_TRUE_BASE_BIN,
+        true_base_bins,
+    )
+    combined_indices = (
+        context_indices.astype(np.int64, copy=False)
+        * NUM_TRUE_BASE_BINS
+        * NUM_ERROR_TYPES
+        + true_base_bins * NUM_ERROR_TYPES
+        + targets[valid_rows].astype(np.int64, copy=False)
+    )
+    counts = np.bincount(
+        combined_indices,
+        minlength=context_count * NUM_TRUE_BASE_BINS * NUM_ERROR_TYPES,
+    ).reshape(counts_shape)
+    return torch.from_numpy(counts.astype(np.float32, copy=False))
+
+
+def _rolling_context_codes(event_bases: np.ndarray, context_length: int) -> np.ndarray:
+    """Return base-4 context codes keyed by exclusive event end position."""
+    event_count = int(event_bases.shape[0])
+    codes_by_end = np.full(event_count + 1, -1, dtype=np.int64)
+    if event_count < context_length:
+        return codes_by_end
+
+    code_count = event_count - context_length + 1
+    codes = np.zeros(code_count, dtype=np.int64)
+    for offset in range(context_length):
+        codes *= NUM_CONTEXT_BASES
+        codes += event_bases[offset : offset + code_count].astype(
+            np.int64,
+            copy=False,
+        )
+    codes_by_end[context_length:] = codes
+    return codes_by_end
 
 
 def _context_index_from_encoded_history(history: Sequence[int], length: int) -> int:
     """Return a flat previous-base context index from encoded base history."""
-    missing = max(0, length - len(history))
-    context = [BASE_TO_IDX["N"]] * missing
-    context.extend(history[-length:])
+    if len(history) < length:
+        raise ValueError("history is shorter than length")
+    context = history[-length:]
     flat_index = 0
     for base_idx in context:
         flat_index = flat_index * NUM_CONTEXT_BASES + int(base_idx)

@@ -1,0 +1,7 @@
+key,consensus_value,passes_filter,homopolymer_length,consensus_count,neighbor_count,total_count,AC,AG,AT,GA,GC,GT,CA,CG,CT,TA,TC,TG,_A,_C,_G,_T,A_,C_,G_,T_,consensus_count_up_to_v1,consensus_count_up_to_v2,consensus_count_up_to_v3,consensus_count_up_to_v4
+AACGT,TGCA,true,2,52,8,60,0,0,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,56,56,56,52
+CAACG,TTGC,true,2,56,4,60,0,0,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,60,56,56,56
+CGTTG,CAAC,true,2,56,4,60,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,60,56,56,56
+GCAAC,GTTG,true,2,56,4,60,0,0,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,60,60,56,56
+GTTGC,AACG,true,2,56,4,60,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,56,56,56,56
+TTGCA,ACGT,true,2,56,0,56,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,56,56,56,56

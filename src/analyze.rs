@@ -1,20 +1,20 @@
+use crate::cmdline::AnalyzeArgs;
+use crate::inference::*;
 use crate::kvmer::*;
 use crate::utils::*;
-use crate::inference::*;
-use crate::cmdline::AnalyzeArgs;
 
-use clap::error;
-use simple_logger::SimpleLogger;
-use log::{info, warn, error};
 use glob::glob;
+use log::{error, info, warn};
+use simple_logger::SimpleLogger;
+use rustc_hash::FxHashMap;
 use std::fs;
 
 pub fn analyze(args: AnalyzeArgs) {
-    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
     // [TODO] Multithreaded version is under development.
-    //rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().unwrap();
-
-    //info!("Using {} threads for analysis.", args.threads);
 
     // Expand globs and categorize files before processing so we can auto-determine -c
     let mut raw_files: Vec<String> = Vec::new();
@@ -29,7 +29,10 @@ pub fn analyze(args: AnalyzeArgs) {
                     } else if is_sketch_file(&file_str) {
                         sketch_files.push(file_str);
                     } else {
-                        warn!("File format not recognized for file: {}. Skipping.", file_str);
+                        warn!(
+                            "File format not recognized for file: {}. Skipping.",
+                            file_str
+                        );
                     }
                 }
                 Err(e) => warn!("Error reading file: {:?}", e),
@@ -40,43 +43,77 @@ pub fn analyze(args: AnalyzeArgs) {
     let c = args.c.unwrap_or_else(|| {
         let raw_refs: Vec<&str> = raw_files.iter().map(|s| s.as_str()).collect();
         let (auto_c, est_file_size) = estimate_c_from_raw_files(&raw_refs);
-        info!("Total estimated input sequence file size (decompressed): {:.2} GB", est_file_size as f64 / (1024.0 * 1024.0 * 1024.0));
+        info!(
+            "Total estimated input sequence file size (decompressed): {:.2} GB",
+            est_file_size as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
         info!("Auto-determined subsampling rate: -c {}", auto_c);
         auto_c
     });
 
-    let mut kvmer_set = KVmerSet::new(args.k, args.v, !args.forward_only);
-
-    // Read query files
-    info!("Processing query files...");
-    for file_str in &raw_files {
-        kvmer_set.add_file_to_kvmer_set(file_str, c, args.trim_front, args.trim_back);
-    }
-    for file_str in &sketch_files {
-        kvmer_set.load(file_str);
-    }
-    info!("Finished processing query files.");
-
-    let analyzer = ErrorAnalyzer::new(args.clone());
-
-    
-    let stats: KVmerStats;
-    if let Some(reference) = &args.reference {
+    // Build the reference consensus FIRST so the query loader can filter
+    // observations to only keys present in the reference.
+    let ref_consensus: Option<FxHashMap<u64, u64>> = if let Some(reference) = &args.reference {
         if args.lower_bound.is_none() {
             info!("Reference is provided. Using default lower bound of 0.");
         }
-        let lower_bound = args.lower_bound.unwrap_or(0);
-
-        let mut reference_kvmer_set = KVmerSet::new(args.k, args.v, true);
-        reference_kvmer_set.add_file_to_kvmer_set(reference, c, args.trim_front, args.trim_back);
-        info!("Loaded reference file: {}", reference);
-
-        stats = kvmer_set.get_stats_with_reference(lower_bound, &reference_kvmer_set, args.first_base_only);
+        info!("Loading reference (file={})…", reference);
+        let map = build_reference_consensus_from_file(
+            reference,
+            args.k,
+            args.v,
+            true,
+            c,
+            args.trim_front,
+            args.trim_back,
+        );
+        info!("ref_consensus built: {} keys retained", map.len());
+        Some(map)
     } else {
+        None
+    };
+
+    let analyzer = ErrorAnalyzer::new(args.clone());
+
+    let stats: KVmerStats = if let Some(rc) = &ref_consensus {
+        // Reference-guided path: accumulate only (key,value) counts — no ValueInfo.
+        // This reduces peak RSS from ~60 GB to ~8-10 GB for typical configurations.
+        if !sketch_files.is_empty() {
+            warn!("Sketch files (.kvmer) are not supported in reference-guided mode and will be skipped.");
+        }
+        let lower_bound = args.lower_bound.unwrap_or(0);
+        // Reference-guided: only keys present in the reference are kept, so the
+        // reference key count is a safe upper bound on distinct keys — pre-size to it.
+        let mut kv_counts =
+            KVmerCountMap::with_capacity(args.k, args.v, !args.forward_only, rc.len());
+        info!("Processing query files...");
+        for file_str in &raw_files {
+            kv_counts.add_file_filtered(file_str, c, args.trim_front, args.trim_back, rc);
+        }
+        info!("Finished processing query files.");
+        info!("Building stats from {} (key,value) pairs...", kv_counts.counts.len());
+        kv_counts.build_full_stats(lower_bound, rc)
+    } else {
+        // Non-reference path: flat count map eliminates ValueInfo (~30× less memory).
         let lower_bound = args.lower_bound.unwrap_or(10);
-        //println!("Error rate: {}", kvmer_set.get_stats(args.threshold));
-        stats = kvmer_set.get_stats(lower_bound, args.first_base_only);
-    }
+        // Non-reference: no safe a-priori bound on distinct kv-mers, so don't
+        // pre-size (an input-size estimate proved unreliable — both under- and
+        // over-shooting). The big analyze win comes from the allocation-free
+        // per-key grouping in `build_full_stats_*`, not from reserving here.
+        let mut kv_counts = KVmerCountMap::new(args.k, args.v, !args.forward_only);
+        info!("Processing query files...");
+        for file_str in &raw_files {
+            kv_counts.add_file(file_str, c, args.trim_front, args.trim_back);
+        }
+        for file_str in &sketch_files {
+            let mut temp = KVmerSet::new(args.k, args.v, !args.forward_only);
+            temp.load(file_str);
+            kv_counts.merge_from_kvmer_set(&temp);
+        }
+        info!("Finished processing query files.");
+        info!("Building stats from {} (key,value) pairs...", kv_counts.counts.len());
+        kv_counts.build_full_stats_no_reference(lower_bound)
+    };
     // if reference is set, the filter should be disabled
     // [FIXME] enable --use-all by default
     if args.reference.is_some() && !args.use_all {
@@ -84,12 +121,22 @@ pub fn analyze(args: AnalyzeArgs) {
     }
 
     let spectrum = analyzer.analyze(&stats);
-    let analysis_output = format!("{}\n{}", header_str(!args.forward_only), spectrum_to_str(&spectrum, !args.forward_only));
+    let analysis_output = format!(
+        "{}\n{}",
+        header_str(),
+        spectrum_to_str(&spectrum, !args.forward_only)
+    );
 
     if let Some(prefix) = &args.output_prefix {
-        fs::write(format!("{}.summary_error_rate.csv", prefix), &analysis_output).unwrap();
+        fs::write(
+            format!("{}.summary_error_rate.csv", prefix),
+            &analysis_output,
+        )
+        .unwrap();
         info!("Output written to prefix {}.", prefix);
     } else {
-        error!("No output prefix provided. Use -o or --output-prefix to specify the output file prefix for the analysis results.");
+        error!(
+            "No output prefix provided. Use -o or --output-prefix to specify the output file prefix for the analysis results."
+        );
     }
 }

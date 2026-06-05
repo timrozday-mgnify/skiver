@@ -16,12 +16,7 @@ pub fn huber_ridge_fit_1d(
 
     // Solve weighted ridge regression (slope regularized, intercept not)
     #[inline]
-    fn solve_weighted_ridge(
-        x: &[f32],
-        y: &[f32],
-        w: &[f32],
-        lambda: f32,
-    ) -> Option<(f32, f32)> {
+    fn solve_weighted_ridge(x: &[f32], y: &[f32], w: &[f32], lambda: f32) -> Option<(f32, f32)> {
         let mut sw = 0.0f32;
         let mut sx = 0.0f32;
         let mut sxx = 0.0f32;

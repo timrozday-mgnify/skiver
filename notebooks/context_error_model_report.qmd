@@ -1,0 +1,77 @@
+---
+title: "Context Error Model Results"
+jupyter: skiver
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  execute-dir: file
+params:
+  results_dir: "../context_error_models"
+  platform: "all"
+  artifact_glob: "*.pt"
+  max_volcano_points: 50000
+  top_parameters: 80
+  max_heatmap_contexts: 80
+  heatmap_context_sample: 500
+  show_per_model_plots: false
+---
+
+This report compares trained context-dependent sequencing error models across all
+platforms using held-out likelihood and AIC.  Per-model parameter plots are
+disabled here by default to keep rendering fast.
+
+To produce a per-platform report with full parameter plots, render with:
+
+```bash
+quarto render context_error_model_report.qmd \
+  -P platform:lq-illumina \
+  -P show_per_model_plots:true \
+  -o context_error_model_lq_illumina.html
+```
+
+Or open one of the pre-configured per-platform notebooks:
+`context_error_model_lq_illumina.qmd`, `context_error_model_hq_illumina.qmd`,
+`context_error_model_ont.qmd`, `context_error_model_pacbio.qmd`.
+
+```{python}
+#| echo: false
+from pathlib import Path
+import os
+
+PARAMS = globals().get("params", {
+    "results_dir": "../context_error_models",
+    "platform": "all",
+    "artifact_glob": "*.pt",
+    "max_volcano_points": 50000,
+    "top_parameters": 80,
+    "max_heatmap_contexts": 80,
+    "heatmap_context_sample": 500,
+    "show_per_model_plots": False,
+})
+
+RESULTS_DIR = Path(
+    os.environ.get("CONTEXT_RESULTS_DIR", PARAMS.get("results_dir", "../context_error_models"))
+).expanduser()
+PLATFORM = str(os.environ.get("CONTEXT_PLATFORM", PARAMS.get("platform", "all")))
+ARTIFACT_GLOB = str(os.environ.get("CONTEXT_ARTIFACT_GLOB", PARAMS.get("artifact_glob", "*.pt")))
+MAX_VOLCANO_POINTS = int(os.environ.get("CONTEXT_MAX_VOLCANO_POINTS", PARAMS.get("max_volcano_points", 50000)))
+TOP_PARAMETERS = int(os.environ.get("CONTEXT_TOP_PARAMETERS", PARAMS.get("top_parameters", 80)))
+MAX_HEATMAP_CONTEXTS = int(os.environ.get("CONTEXT_MAX_HEATMAP_CONTEXTS", PARAMS.get("max_heatmap_contexts", 80)))
+HEATMAP_CONTEXT_SAMPLE = int(os.environ.get("CONTEXT_HEATMAP_CONTEXT_SAMPLE", PARAMS.get("heatmap_context_sample", 500)))
+SHOW_PER_MODEL_PLOTS = str(PARAMS.get("show_per_model_plots", False)).lower() not in ("false", "0", "no")
+
+print(f"Results directory : {RESULTS_DIR.resolve()}")
+print(f"Platform filter   : {PLATFORM}")
+print(f"Artifact glob     : {ARTIFACT_GLOB}")
+print(f"Per-model plots   : {SHOW_PER_MODEL_PLOTS}")
+```
+
+{{< include _context_error_model_body.qmd >}}

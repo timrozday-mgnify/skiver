@@ -1,0 +1,22 @@
+{
+  "models": [
+    {"id": "context_1",  "type": "combinatorial_context", "context_length": 1},
+    {"id": "context_2",  "type": "combinatorial_context", "context_length": 2},
+    {"id": "context_3",  "type": "combinatorial_context", "context_length": 3},
+    {"id": "context_4",  "type": "combinatorial_context", "context_length": 4},
+    {"id": "context_5",  "type": "combinatorial_context", "context_length": 5},
+    {"id": "context_6",  "type": "combinatorial_context", "context_length": 6},
+    {"id": "additive_1",  "type": "additive_context", "context_length": 1},
+    {"id": "additive_2",  "type": "additive_context", "context_length": 2},
+    {"id": "additive_3",  "type": "additive_context", "context_length": 3},
+    {"id": "additive_4",  "type": "additive_context", "context_length": 4},
+    {"id": "additive_5",  "type": "additive_context", "context_length": 5},
+    {"id": "additive_6",  "type": "additive_context", "context_length": 6},
+    {"id": "additive_7",  "type": "additive_context", "context_length": 7},
+    {"id": "additive_8",  "type": "additive_context", "context_length": 8},
+    {"id": "additive_9",  "type": "additive_context", "context_length": 9},
+    {"id": "additive_10",  "type": "additive_context", "context_length": 10},
+    {"id": "additive_11",  "type": "additive_context", "context_length": 11},
+    {"id": "additive_12",  "type": "additive_context", "context_length": 12}
+  ]
+}

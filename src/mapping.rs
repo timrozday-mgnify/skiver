@@ -1,13 +1,16 @@
-use simple_logger::SimpleLogger;
+use crate::{seeding::*, types::*};
 use log::{info, warn};
 use needletail::parse_fastx_file;
 use rust_htslib::{bam, bam::Read as BamRead}; // Added rust-htslib for BAM/SAM support
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use simple_logger::SimpleLogger;
 use std::collections::HashMap;
-use crate::{seeding::*, types::*};
 
 pub fn map(args: crate::cmdline::MapArgs) {
-    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
     let mut kmer_set = KmerSet::new(args.k, true);
     kmer_set.add_file_to_kmer_set(&args.reference, args.c, args.trim_front, args.trim_back);
     info!("Loaded reference file: {}", args.reference);
@@ -18,15 +21,24 @@ pub fn map(args: crate::cmdline::MapArgs) {
     info!("Processing query files...");
     for file in &args.files {
         let (matched, total) = kmer_set.query_file(
-            file, args.c, args.lower_bound, args.sample_rate,
-            !args.forward_only, args.print_verbose, args.trim_front, args.trim_back
+            file,
+            args.c,
+            args.lower_bound,
+            args.sample_rate,
+            !args.forward_only,
+            args.print_verbose,
+            args.trim_front,
+            args.trim_back,
         );
         total_matched += matched;
         total_kmers += total;
     }
     info!("Finished processing query files.");
-    info!("At k={}: estimated overall kmer match rate: {}/{} = {:.4}%",
-        args.k, total_matched, total_kmers,
+    info!(
+        "At k={}: estimated overall kmer match rate: {}/{} = {:.4}%",
+        args.k,
+        total_matched,
+        total_kmers,
         total_matched as f64 / total_kmers as f64 * 100.
     );
 }
@@ -73,27 +85,55 @@ impl KmerSet {
         (count, seed_vec.len() as u32)
     }
 
-    fn extract_markers_masked(&self, string: &[u8], kmer_vec: &mut Vec<u64>, _value_vec: &mut Vec<u64>, c: usize, bidirectional: bool, trim_front: usize, trim_back: usize) {
+    /// Extract subsampled k-mer keys from `string` into `kmer_vec`.
+    /// `KmerSet` is key-only (value length 0), so the seeding routines' value and
+    /// `ValueInfo` outputs are discarded into local scratch buffers.
+    fn extract_markers_masked(
+        &self,
+        string: &[u8],
+        kmer_vec: &mut Vec<u64>,
+        c: usize,
+        bidirectional: bool,
+        trim_front: usize,
+        trim_back: usize,
+    ) {
         let start = std::cmp::min(trim_front, string.len());
         let end = string.len().saturating_sub(trim_back);
 
-        // extract sketched kv-mers from the given sequence string
-        let mut _value_info_vec: Vec<ValueInfo> = Vec::new();
+        // KmerSet keeps only keys; discard value / ValueInfo outputs.
+        let mut value_scratch: Vec<u64> = Vec::new();
+        let mut value_info_scratch: Vec<ValueInfo> = Vec::new();
         #[cfg(any(target_arch = "x86_64"))]
         {
             if is_x86_feature_detected!("avx2") {
                 use crate::avx2_seeding::*;
                 unsafe {
-                    extract_markers_avx2_masked(&string[start..end], kmer_vec, _value_vec, &mut _value_info_vec, c, self.key_size as usize, 0 as usize, bidirectional);
+                    extract_markers_avx2_masked(
+                        &string[start..end],
+                        kmer_vec,
+                        &mut value_scratch,
+                        &mut value_info_scratch,
+                        c,
+                        self.key_size as usize,
+                        0,
+                        bidirectional,
+                        0,
+                    );
                 }
-            } else {
-                fmh_seeds_masked(&string[start..end], kmer_vec, _value_vec, &mut _value_info_vec, c, self.key_size as usize, 0 as usize, bidirectional);
+                return;
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            fmh_seeds_masked(&string[start..end], kmer_vec, _value_vec, &mut _value_info_vec, c, self.key_size as usize, 0 as usize, bidirectional);
-        }
+        fmh_seeds_masked(
+            &string[start..end],
+            kmer_vec,
+            &mut value_scratch,
+            &mut value_info_scratch,
+            c,
+            self.key_size as usize,
+            0,
+            bidirectional,
+            0,
+        );
     }
 
     pub fn add_file_to_kmer_set(
@@ -103,46 +143,12 @@ impl KmerSet {
         trim_front: usize,
         trim_back: usize,
     ) {
-        // Handle SAM/BAM files
-        if seq_file.ends_with(".bam") || seq_file.ends_with(".sam") {
-            match bam::Reader::from_path(seq_file) {
-                Ok(mut reader) => {
-                    for record_result in reader.records() {
-                        match record_result {
-                            Ok(record) => {
-                                let seq = record.seq().as_bytes(); // Extracts standard ACGT sequence
-                                let mut kmer_vec: Vec<u64> = Vec::new();
-                                let mut _value_vec: Vec<u64> = Vec::new();
-                                self.extract_markers_masked(&seq, &mut kmer_vec, &mut _value_vec, c, self.bidirectional, trim_front, trim_back);
-                                self.add_seed_vector(&kmer_vec);
-                            }
-                            Err(e) => warn!("Error reading BAM/SAM record: {}", e),
-                        }
-                    }
-                }
-                Err(e) => warn!("{} is not a valid BAM/SAM file (Error: {}); skipping.", seq_file, e),
-            }
-        }
-        // Fallback to Fastx parser for FASTA/FASTQ
-        else {
-            match parse_fastx_file(seq_file) {
-                Ok(mut reader) => {
-                    while let Some(record) = reader.next() {
-                        match record {
-                            Ok(record) => {
-                                let seq = record.seq();
-                                let mut kmer_vec: Vec<u64> = Vec::new();
-                                let mut _value_vec: Vec<u64> = Vec::new();
-                                self.extract_markers_masked(seq.as_ref(), &mut kmer_vec, &mut _value_vec, c, self.bidirectional, trim_front, trim_back);
-                                self.add_seed_vector(&kmer_vec);
-                            }
-                            Err(e) => warn!("Error reading Fastx record: {}", e),
-                        }
-                    }
-                }
-                Err(_) => warn!("{} is not a valid fasta/fastq file; skipping.", seq_file),
-            }
-        }
+        let bidirectional = self.bidirectional;
+        for_each_read_seq(seq_file, |seq| {
+            let mut kmer_vec: Vec<u64> = Vec::new();
+            self.extract_markers_masked(seq, &mut kmer_vec, c, bidirectional, trim_front, trim_back);
+            self.add_seed_vector(&kmer_vec);
+        });
     }
 
     /**
@@ -169,71 +175,58 @@ impl KmerSet {
             println!("total,matched");
         }
 
-        // Handle SAM/BAM files
-        if seq_file.ends_with(".bam") || seq_file.ends_with(".sam") {
-            match bam::Reader::from_path(seq_file) {
-                Ok(mut reader) => {
-                    for record_result in reader.records() {
-                        match record_result {
-                            Ok(record) => {
-                                read_count += 1;
-                                if read_count % sample_per_num_read != 0 {
-                                    continue;
-                                }
-                                let seq = record.seq().as_bytes();
-                                let mut kmer_vec: Vec<u64> = Vec::new();
-                                let mut _value_vec: Vec<u64> = Vec::new();
-                                self.extract_markers_masked(&seq, &mut kmer_vec, &mut _value_vec, c, bidirectional, trim_front, trim_back);
-
-                                let (matched, total) = self.query_seed_vector(&kmer_vec);
-                                if print_verbose {
-                                    println!("{},{}", total, matched);
-                                }
-                                if matched >= threshold {
-                                    matched_kmers += matched;
-                                    total_kmers += total;
-                                }
-                            }
-                            Err(e) => warn!("Error reading BAM/SAM record: {}", e),
-                        }
-                    }
-                }
-                Err(e) => warn!("{} is not a valid BAM/SAM file (Error: {}); skipping.", seq_file, e),
+        for_each_read_seq(seq_file, |seq| {
+            read_count += 1;
+            if read_count % sample_per_num_read != 0 {
+                return;
             }
-        }
-        // Fallback to Fastx parser for FASTA/FASTQ
-        else {
-            match parse_fastx_file(seq_file) {
-                Ok(mut reader) => {
-                    while let Some(record) = reader.next() {
-                        match record {
-                            Ok(record) => {
-                                read_count += 1;
-                                if read_count % sample_per_num_read != 0 {
-                                    continue;
-                                }
-                                let seq = record.seq();
-                                let mut kmer_vec: Vec<u64> = Vec::new();
-                                let mut _value_vec: Vec<u64> = Vec::new();
-                                self.extract_markers_masked(seq.as_ref(), &mut kmer_vec, &mut _value_vec, c, bidirectional, trim_front, trim_back);
+            let mut kmer_vec: Vec<u64> = Vec::new();
+            self.extract_markers_masked(seq, &mut kmer_vec, c, bidirectional, trim_front, trim_back);
 
-                                let (matched, total) = self.query_seed_vector(&kmer_vec);
-                                if print_verbose {
-                                    println!("{},{}", total, matched);
-                                }
-                                if matched >= threshold {
-                                    matched_kmers += matched;
-                                    total_kmers += total;
-                                }
-                            }
-                            Err(e) => warn!("Error reading Fastx record: {}", e),
-                        }
-                    }
-                }
-                Err(_) => warn!("{} is not a valid fasta/fastq file; skipping.", seq_file),
+            let (matched, total) = self.query_seed_vector(&kmer_vec);
+            if print_verbose {
+                println!("{},{}", total, matched);
             }
-        }
+            if matched >= threshold {
+                matched_kmers += matched;
+                total_kmers += total;
+            }
+        });
 
         (matched_kmers, total_kmers)
+    }
+}
+
+/// Invoke `f` with each read's sequence bytes from a FASTA/FASTQ/BAM/SAM file,
+/// logging (and skipping) unreadable files or records. Shared by
+/// [`KmerSet::add_file_to_kmer_set`] and [`KmerSet::query_file`].
+fn for_each_read_seq<F: FnMut(&[u8])>(seq_file: &str, mut f: F) {
+    if seq_file.ends_with(".bam") || seq_file.ends_with(".sam") {
+        match bam::Reader::from_path(seq_file) {
+            Ok(mut reader) => {
+                for record_result in reader.records() {
+                    match record_result {
+                        Ok(record) => f(&record.seq().as_bytes()),
+                        Err(e) => warn!("Error reading BAM/SAM record: {}", e),
+                    }
+                }
+            }
+            Err(e) => warn!(
+                "{} is not a valid BAM/SAM file (Error: {}); skipping.",
+                seq_file, e
+            ),
+        }
+    } else {
+        match parse_fastx_file(seq_file) {
+            Ok(mut reader) => {
+                while let Some(record) = reader.next() {
+                    match record {
+                        Ok(record) => f(record.seq().as_ref()),
+                        Err(e) => warn!("Error reading Fastx record: {}", e),
+                    }
+                }
+            }
+            Err(_) => warn!("{} is not a valid fasta/fastq file; skipping.", seq_file),
+        }
     }
 }

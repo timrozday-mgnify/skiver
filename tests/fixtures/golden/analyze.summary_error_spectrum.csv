@@ -1,0 +1,3 @@
+operation,prev_base,next_base,total,forward
+A>T,C,A,4,0
+T>A,T,G,8,8

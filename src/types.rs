@@ -24,8 +24,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use serde::{Serialize, Deserialize};
 
 pub type Kmer = u64;
 
@@ -41,12 +41,15 @@ pub struct ValueInfo {
     pub dist_to_read_end: u32,
     /// `true` if the k,v-mer came from the forward strand, `false` for RC.
     pub is_forward: bool,
+    /// Sequential 0-based index of the source read within this sketching run.
+    /// Observations sharing a `read_id` came from the same physical read.
+    pub read_id: u64,
 }
 
 /**
  * A lookup table to convert a byte to a 2-bit sequence.
  * Adopted from https://github.com/bluenote-1577/sylph/blob/main/src/types.rs
- * 
+ *
  * A/a -> 0
  * C/c -> 1
  * G/g -> 2
@@ -74,7 +77,6 @@ pub const SEQ_TO_BYTE: [u8; 4] = [b'A', b'C', b'G', b'T'];
 pub const SEQ_TO_CHAR: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
 // A -> T (3), C -> G (2), G -> C (1), T -> A (0), N -> N (4)
 pub const SEQ_TO_COMPLEMENT_BIN: [u8; 5] = [3, 2, 1, 0, 4];
-
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone, Copy)]
 pub enum EditOperation {
@@ -190,7 +192,6 @@ pub const BASES_TO_SUBSTITUTION_CANONICAL: [[Option<EditOperation>; 4]; 4] = {
     arr
 };
 
-
 pub const BASES_TO_INSERTION: [Option<EditOperation>; 4] = [
     Some(EditOperation::_A),
     Some(EditOperation::_C),
@@ -223,30 +224,24 @@ pub const ALL_OPERATIONS: [EditOperation; 20] = [
     EditOperation::AC,
     EditOperation::AG,
     EditOperation::AT,
-
     EditOperation::GA,
     EditOperation::GC,
     EditOperation::GT,
-
     EditOperation::CA,
     EditOperation::CG,
     EditOperation::CT,
-
     EditOperation::TA,
     EditOperation::TC,
     EditOperation::TG,
-
     EditOperation::_A,
     EditOperation::_C,
     EditOperation::_G,
     EditOperation::_T,
-
     EditOperation::A_,
     EditOperation::C_,
     EditOperation::G_,
     EditOperation::T_,
 ];
-
 
 pub const ALL_OPERATIONS_CANONICAL: [EditOperation; 10] = [
     EditOperation::CA,
@@ -255,10 +250,8 @@ pub const ALL_OPERATIONS_CANONICAL: [EditOperation; 10] = [
     EditOperation::TA,
     EditOperation::TC,
     EditOperation::TG,
-
     EditOperation::_G,
     EditOperation::_T,
-
     EditOperation::G_,
     EditOperation::T_,
 ];
@@ -272,9 +265,11 @@ pub struct NeighborInfo {
 }
 
 pub fn sbs96_str(op: &(EditOperation, u8, u8)) -> String {
-    format!("{}[{}]{}", SEQ_TO_CHAR[op.1 as usize], op.0, SEQ_TO_CHAR[op.2 as usize])
+    format!(
+        "{}[{}]{}",
+        SEQ_TO_CHAR[op.1 as usize], op.0, SEQ_TO_CHAR[op.2 as usize]
+    )
 }
-
 
 #[derive(Clone)]
 pub struct SequenceInfo {
