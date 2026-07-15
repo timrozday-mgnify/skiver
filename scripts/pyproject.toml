@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skiver-generate"
+version = "0.1.0"
+description = "Generative application of Skiver context error models (skiver generate)."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+]
+
+[project.scripts]
+# The generic subprocess interface other tools (e.g. genome-blender) call.
+skiver-generate = "generate:main"
+
+[tool.setuptools]
+# Flat layout: the `generate` module and the `lib` package both live in scripts/.
+py-modules = ["generate", "simulate_errors"]
+packages = ["lib"]
