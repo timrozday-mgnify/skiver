@@ -13,43 +13,34 @@ format:
 execute:
   warning: false
   execute-dir: file
-params:
-  results_dir: "../context_error_models"
-  platform: "ont"
-  artifact_glob: "*.pt"
-  max_volcano_points: 50000
-  top_parameters: 80
-  max_heatmap_contexts: 80
-  heatmap_context_sample: 500
-  show_per_model_plots: true
 ---
 
 Context-dependent error model results for the **ont** (Oxford Nanopore) platform.
 
 ```{python}
+#| tags: [parameters]
+results_dir = "../context_error_models"
+platform = "ont"
+artifact_glob = "*.pt"
+max_volcano_points = 50000
+top_parameters = 80
+max_heatmap_contexts = 80
+heatmap_context_sample = 500
+show_per_model_plots = True
+```
+
+```{python}
 #| echo: false
 from pathlib import Path
-import os
 
-PARAMS = globals().get("params", {
-    "results_dir": "../context_error_models",
-    "platform": "ont",
-    "artifact_glob": "*.pt",
-    "max_volcano_points": 50000,
-    "top_parameters": 80,
-    "max_heatmap_contexts": 80,
-    "heatmap_context_sample": 500,
-    "show_per_model_plots": True,
-})
-
-RESULTS_DIR = Path(PARAMS.get("results_dir", "../context_error_models")).expanduser()
-PLATFORM = str(PARAMS.get("platform", "ont"))
-ARTIFACT_GLOB = str(PARAMS.get("artifact_glob", "*.pt"))
-MAX_VOLCANO_POINTS = int(PARAMS.get("max_volcano_points", 50000))
-TOP_PARAMETERS = int(PARAMS.get("top_parameters", 80))
-MAX_HEATMAP_CONTEXTS = int(PARAMS.get("max_heatmap_contexts", 80))
-HEATMAP_CONTEXT_SAMPLE = int(PARAMS.get("heatmap_context_sample", 500))
-SHOW_PER_MODEL_PLOTS = str(PARAMS.get("show_per_model_plots", True)).lower() not in ("false", "0", "no")
+RESULTS_DIR = Path(results_dir).expanduser()
+PLATFORM = str(platform)
+ARTIFACT_GLOB = str(artifact_glob)
+MAX_VOLCANO_POINTS = int(max_volcano_points)
+TOP_PARAMETERS = int(top_parameters)
+MAX_HEATMAP_CONTEXTS = int(max_heatmap_contexts)
+HEATMAP_CONTEXT_SAMPLE = int(heatmap_context_sample)
+SHOW_PER_MODEL_PLOTS = str(show_per_model_plots).lower() not in ("false", "0", "no")
 
 print(f"Results directory : {RESULTS_DIR.resolve()}")
 print(f"Platform filter   : {PLATFORM}")
