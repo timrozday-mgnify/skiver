@@ -557,14 +557,20 @@ _composed_chunks = [
     extract_composed_params(name, art)
     for name, art in artifacts.items()
 ]
-composed_params = pd.concat([df for df in _composed_chunks if not df.empty], ignore_index=True)
+composed_params = pd.concat(
+    [df for df in _composed_chunks if not df.empty],
+    ignore_index=True,
+) if any(not df.empty for df in _composed_chunks) else pd.DataFrame()
 del _composed_chunks
 
 _position_chunks = [
     extract_position_params(name, art)
     for name, art in artifacts.items()
 ]
-position_params = pd.concat([df for df in _position_chunks if not df.empty], ignore_index=True)
+position_params = pd.concat(
+    [df for df in _position_chunks if not df.empty],
+    ignore_index=True,
+) if any(not df.empty for df in _position_chunks) else pd.DataFrame()
 del _position_chunks
 
 _quality_chunks = [
