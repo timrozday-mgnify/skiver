@@ -1,0 +1,14 @@
+{
+  "_comment": "Named platform presets for `skiver generate`. Each maps to a bundled trained artifact in this directory. Aliases let callers use platform-style names.",
+  "presets": {
+    "hq-illumina": "additive_7_hq-illumina.pt",
+    "lq-illumina": "additive_7_lq-illumina.pt",
+    "ont":         "additive_12_ont.pt",
+    "pacbio":      "additive_12_pacbio.pt"
+  },
+  "aliases": {
+    "illumina":  "hq-illumina",
+    "nanopore":  "ont",
+    "ont-r10":   "ont"
+  }
+}
